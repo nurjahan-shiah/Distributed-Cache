@@ -59,21 +59,59 @@ class KVStore:
             }
 
     def snapshot(self):
+        """Write live, unexpired entries to disk atomically.
+
+        The copy is taken under the lock, then written to a temp file in
+        the same directory and renamed over the snapshot. A crash mid
+        write therefore leaves either the old snapshot or the new one,
+        never a half written file. Returns how many entries were saved,
+        or 0 when no snapshot path is configured.
+        """
         if not self.snapshot_path:
-            return
+            return 0
         with self._lock:
             data = {
                 k: {"value": v, "expires_at": e}
                 for k, (v, e) in self._data.items()
                 if not self._is_expired(e)
             }
-        self.snapshot_path.write_text(json.dumps(data))
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.snapshot_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data))
+        tmp_path.replace(self.snapshot_path)
+        return len(data)
 
     def load(self):
+        """Load a snapshot written by snapshot(), if one exists.
+
+        Expired entries are dropped, malformed entries are skipped, and
+        a missing or corrupt snapshot leaves the store empty instead of
+        failing startup. Capacity is enforced in LRU order, oldest
+        first, so a snapshot larger than capacity still loads cleanly.
+        Returns how many entries were loaded.
+        """
         if not self.snapshot_path or not self.snapshot_path.exists():
-            return
-        data = json.loads(self.snapshot_path.read_text())
+            return 0
+        try:
+            data = json.loads(self.snapshot_path.read_text())
+        except (ValueError, OSError):
+            return 0
+        if not isinstance(data, dict):
+            return 0
+        loaded = 0
         with self._lock:
             for key, item in data.items():
-                if not self._is_expired(item["expires_at"]):
-                    self._data[key] = (item["value"], item["expires_at"])
+                if not isinstance(item, dict):
+                    continue
+                if "value" not in item or "expires_at" not in item:
+                    continue
+                if self._is_expired(item["expires_at"]):
+                    continue
+                if key in self._data:
+                    del self._data[key]
+                self._data[key] = (item["value"], item["expires_at"])
+                loaded += 1
+                while len(self._data) > self.capacity:
+                    self._data.popitem(last=False)
+                    self.evictions += 1
+        return loaded

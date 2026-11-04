@@ -54,3 +54,85 @@ def test_api():
     r = client.get("/cache/hello")
     assert r.json()["value"] == "world"
     assert client.get("/cache/nope").status_code == 404
+
+
+def test_snapshot_and_load_roundtrip(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=10, snapshot_path=path)
+    s.set("a", "1")
+    s.set("b", "2")
+    assert s.snapshot() == 2
+    assert path.exists()
+    restarted = KVStore(capacity=10, snapshot_path=path)
+    assert restarted.load() == 2
+    assert restarted.get("a") == "1"
+    assert restarted.get("b") == "2"
+
+
+def test_snapshot_preserves_lru_order(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=3, snapshot_path=path)
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("c", "3")
+    s.get("a")
+    s.snapshot()
+    restarted = KVStore(capacity=3, snapshot_path=path)
+    restarted.load()
+    restarted.set("d", "4")
+    assert restarted.get("b") is None
+    assert restarted.get("a") == "1"
+
+
+def test_snapshot_skips_expired(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=10, snapshot_path=path)
+    s.set("fresh", "1")
+    s.set("stale", "2", ttl_seconds=0.05)
+    time.sleep(0.07)
+    assert s.snapshot() == 1
+    restarted = KVStore(capacity=10, snapshot_path=path)
+    assert restarted.load() == 1
+    assert restarted.get("stale") is None
+
+
+def test_snapshot_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=10, snapshot_path=path)
+    s.set("a", "1")
+    s.snapshot()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["snap.json"]
+
+
+def test_load_missing_file_is_noop(tmp_path):
+    s = KVStore(capacity=10, snapshot_path=tmp_path / "missing.json")
+    assert s.load() == 0
+    assert s.stats()["size"] == 0
+
+
+def test_load_corrupt_file_is_noop(tmp_path):
+    path = tmp_path / "snap.json"
+    path.write_text("not json at all")
+    s = KVStore(capacity=10, snapshot_path=path)
+    assert s.load() == 0
+    assert s.stats()["size"] == 0
+
+
+def test_load_enforces_capacity(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=10, snapshot_path=path)
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("c", "3")
+    s.snapshot()
+    small = KVStore(capacity=2, snapshot_path=path)
+    small.load()
+    assert small.stats()["size"] == 2
+    assert small.get("a") is None
+    assert small.get("c") == "3"
+
+
+def test_api_store_has_snapshot_path():
+    from app.main import store as api_store
+
+    assert api_store.snapshot_path is not None

@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 1 is done. The project is finished when every item below is checked off.
+Day 2 is done, 2026-11-03. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -15,6 +15,9 @@ Day 1 is done. The project is finished when every item below is checked off.
 - `DELETE /cache/{key}`
 - `GET /stats`, hits, misses, evictions, and current size
 - LRU eviction when the store is full, thread safe access with a lock
+- Disk persistence, the store snapshots to data/cache_snapshot.json on
+  every write and delete, and loads that snapshot on startup, so keys
+  survive a restart
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -32,7 +35,7 @@ pytest
 
 ## Daily build plan (one feature plus tests per day)
 - [x] Day 1, Core store plus HTTP API, LRU, TTL, thread safety, tests
-- [ ] Day 2, Persistence to disk, snapshot and load on startup
+- [x] Day 2, Persistence to disk, snapshot and load on startup, 2026-11-03
 - [ ] Day 3, Consistent hashing, sharded nodes
 - [ ] Day 4, LFU eviction policy switch
 - [ ] Day 5, Background TTL sweep
@@ -57,3 +60,11 @@ pytest
   later optimisation, and the tradeoff is recorded when it lands.
 - The database is not the source of truth here, the cache is. Persistence is
   a best effort snapshot, not a durable log, until Day 12.
+- Day 2 snapshot design: snapshot writes go to a temp file in the same
+  directory and are renamed over the old snapshot, so a crash mid write
+  never leaves a half written file. Expired entries are dropped on
+  snapshot and on load, a missing or corrupt snapshot leaves the store
+  empty instead of failing startup, and load enforces capacity in LRU
+  order. Snapshotting on every write is simple and correct, but it is
+  O(n) per write, which is the cost Day 12, the write ahead log, exists
+  to fix.
