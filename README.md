@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 2 is done, 2026-11-03. The project is finished when every item below is checked off.
+Day 3 is done, 2026-11-04. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -18,6 +18,9 @@ Day 2 is done, 2026-11-03. The project is finished when every item below is chec
 - Disk persistence, the store snapshots to data/cache_snapshot.json on
   every write and delete, and loads that snapshot on startup, so keys
   survive a restart
+- Consistent hashing, keys route to one of three nodes through a ring
+  with virtual nodes, `GET /cluster` shows per node sizes and
+  `GET /cluster/route/{key}` shows which node owns a key
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -36,7 +39,7 @@ pytest
 ## Daily build plan (one feature plus tests per day)
 - [x] Day 1, Core store plus HTTP API, LRU, TTL, thread safety, tests
 - [x] Day 2, Persistence to disk, snapshot and load on startup, 2026-11-03
-- [ ] Day 3, Consistent hashing, sharded nodes
+- [x] Day 3, Consistent hashing, sharded nodes, 2026-11-04
 - [ ] Day 4, LFU eviction policy switch
 - [ ] Day 5, Background TTL sweep
 - [ ] Day 6, Stats and health endpoints
@@ -68,3 +71,10 @@ pytest
   order. Snapshotting on every write is simple and correct, but it is
   O(n) per write, which is the cost Day 12, the write ahead log, exists
   to fix.
+- Day 3 sharding design: each real node owns 100 virtual nodes on an
+  MD5 ring, so keys spread evenly and adding a node moves only the keys
+  on that node's virtual nodes, not the whole dataset. The cluster
+  migrates keys on a clean add or remove, preserving TTLs, so a planned
+  topology change does not lose keys. An unplanned node loss still loses
+  its keys, since there is no replication yet, and that is exactly what
+  Day 10 is for.

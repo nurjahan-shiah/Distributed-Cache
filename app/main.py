@@ -1,14 +1,16 @@
-"""Day 2, HTTP API around the KV store, with disk persistence."""
+"""Day 3, HTTP API around the KV store, with disk persistence and sharding."""
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from cache.cluster import ShardedStore
 from cache.store import KVStore
 
 app = FastAPI(title="Distributed Cache, KV Store")
 store = KVStore(capacity=1000, snapshot_path=Path("data/cache_snapshot.json"))
 store.load()
+cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"), capacity=1000)
 
 
 class SetRequest(BaseModel):
@@ -42,3 +44,16 @@ def delete_key(key: str):
 @app.get("/stats")
 def stats():
     return store.stats()
+
+
+@app.get("/cluster")
+def cluster_stats():
+    return cluster.stats()
+
+
+@app.get("/cluster/route/{key}")
+def cluster_route(key: str):
+    node = cluster.node_for(key)
+    if node is None:
+        raise HTTPException(status_code=404, detail="No nodes available")
+    return {"key": key, "node": node}

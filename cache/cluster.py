@@ -1,0 +1,96 @@
+"""Day 3, sharded store: keys route to nodes through a hash ring.
+
+Each node is a plain KVStore. The cluster owns the ring, so a caller
+never picks a node directly. When a node joins or leaves, keys whose
+owner changes are moved to their new owner, so a topology change does
+not silently lose keys. Replication is not here yet, that is Day 10,
+so a node that disappears without a clean remove still loses its keys.
+"""
+import time
+
+from cache.ring import ConsistentHashRing
+from cache.store import KVStore
+
+
+class ShardedStore:
+    def __init__(self, nodes=(), capacity=1000, replicas=100):
+        self.capacity = capacity
+        self.ring = ConsistentHashRing(replicas=replicas)
+        self.shards = {}
+        for node in nodes:
+            self.add_node(node)
+
+    def node_for(self, key):
+        return self.ring.get_node(key)
+
+    def _migrate_all(self):
+        """Move every key whose ring owner changed to its new owner."""
+        all_entries = []
+        for shard in self.shards.values():
+            all_entries.extend(shard.entries())
+        for shard in self.shards.values():
+            for key, _value, _expires_at in shard.entries():
+                shard.delete(key)
+        for key, value, expires_at in all_entries:
+            node = self.ring.get_node(key)
+            if node is None:
+                continue
+            ttl = None
+            if expires_at is not None:
+                ttl = expires_at - time.time()
+                if ttl <= 0:
+                    continue
+            self.shards[node].set(key, value, ttl_seconds=ttl)
+
+    def add_node(self, node):
+        if node in self.shards:
+            return False
+        self.shards[node] = KVStore(capacity=self.capacity)
+        self.ring.add_node(node)
+        self._migrate_all()
+        return True
+
+    def remove_node(self, node):
+        if node not in self.shards:
+            return False
+        doomed = self.shards.pop(node)
+        self.ring.remove_node(node)
+        entries = doomed.entries()
+        for key, value, expires_at in entries:
+            owner = self.ring.get_node(key)
+            if owner is None:
+                continue
+            ttl = None
+            if expires_at is not None:
+                ttl = expires_at - time.time()
+                if ttl <= 0:
+                    continue
+            self.shards[owner].set(key, value, ttl_seconds=ttl)
+        return True
+
+    def set(self, key, value, ttl_seconds=None):
+        node = self.ring.get_node(key)
+        if node is None:
+            return False
+        self.shards[node].set(key, value, ttl_seconds)
+        return True
+
+    def get(self, key):
+        node = self.ring.get_node(key)
+        if node is None:
+            return None
+        return self.shards[node].get(key)
+
+    def delete(self, key):
+        node = self.ring.get_node(key)
+        if node is None:
+            return False
+        return self.shards[node].delete(key)
+
+    def stats(self):
+        per_node = {name: shard.stats() for name, shard in self.shards.items()}
+        return {
+            "nodes": sorted(self.shards),
+            "total_size": sum(s["size"] for s in per_node.values()),
+            "per_node": per_node,
+        }

@@ -48,6 +48,21 @@ class KVStore:
         with self._lock:
             return self._data.pop(key, None) is not None
 
+    def entries(self):
+        """Snapshot of live entries as (key, value, expires_at) triples.
+
+        Expired entries are dropped. Used by the sharded cluster on
+        Day 3 to move keys when a node joins or leaves.
+        """
+        with self._lock:
+            live = []
+            for key, (value, expires_at) in list(self._data.items()):
+                if self._is_expired(expires_at):
+                    del self._data[key]
+                else:
+                    live.append((key, value, expires_at))
+            return live
+
     def stats(self):
         with self._lock:
             return {
