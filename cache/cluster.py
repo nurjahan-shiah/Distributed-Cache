@@ -13,8 +13,9 @@ from cache.store import KVStore
 
 
 class ShardedStore:
-    def __init__(self, nodes=(), capacity=1000, replicas=100):
+    def __init__(self, nodes=(), capacity=1000, replicas=100, eviction_policy="lru"):
         self.capacity = capacity
+        self.eviction_policy = eviction_policy
         self.ring = ConsistentHashRing(replicas=replicas)
         self.shards = {}
         for node in nodes:
@@ -42,10 +43,18 @@ class ShardedStore:
                     continue
             self.shards[node].set(key, value, ttl_seconds=ttl)
 
+    def set_eviction_policy(self, policy):
+        """Switch every shard to the given policy, lru or lfu."""
+        for shard in self.shards.values():
+            shard.set_eviction_policy(policy)
+        self.eviction_policy = policy
+
     def add_node(self, node):
         if node in self.shards:
             return False
-        self.shards[node] = KVStore(capacity=self.capacity)
+        self.shards[node] = KVStore(
+            capacity=self.capacity, eviction_policy=self.eviction_policy
+        )
         self.ring.add_node(node)
         self._migrate_all()
         return True
@@ -94,3 +103,4 @@ class ShardedStore:
             "total_size": sum(s["size"] for s in per_node.values()),
             "per_node": per_node,
         }
+

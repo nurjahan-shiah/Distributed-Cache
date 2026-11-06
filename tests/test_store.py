@@ -1,6 +1,7 @@
 import threading
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -221,3 +222,133 @@ def test_cluster_api():
     assert r.json()["nodes"] == ["node-a", "node-b", "node-c"]
     r = client.get("/cluster/route/hello")
     assert r.json()["node"] in ("node-a", "node-b", "node-c")
+
+
+
+def test_lfu_evicts_least_frequently_used():
+    s = KVStore(capacity=2, eviction_policy="lfu")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.get("a")
+    s.get("a")
+    s.set("c", "3")
+    assert s.get("b") is None
+    assert s.get("a") == "1"
+    assert s.get("c") == "3"
+
+
+def test_lfu_tiebreaks_by_least_recently_used():
+    s = KVStore(capacity=3, eviction_policy="lfu")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("c", "3")
+    s.get("b")
+    s.set("d", "4")
+    assert s.get("a") is None
+    assert s.get("c") == "3"
+    assert s.get("b") == "2"
+
+
+def test_lfu_set_on_existing_key_counts_as_access():
+    s = KVStore(capacity=2, eviction_policy="lfu")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("a", "1 again")
+    s.set("c", "3")
+    assert s.get("b") is None
+    assert s.get("a") == "1 again"
+
+
+def test_lfu_delete_resets_frequency():
+    s = KVStore(capacity=2, eviction_policy="lfu")
+    s.set("a", "1")
+    s.get("a")
+    s.get("a")
+    assert s.delete("a") is True
+    s.set("a", "1 again")
+    s.set("b", "2")
+    s.set("c", "3")
+    assert s.get("a") is None
+    assert s.get("b") == "2"
+
+
+def test_set_eviction_policy_validates():
+    s = KVStore(capacity=10)
+    with pytest.raises(ValueError):
+        s.set_eviction_policy("random")
+    with pytest.raises(ValueError):
+        KVStore(capacity=10, eviction_policy="random")
+
+
+def test_switch_policy_changes_eviction():
+    s = KVStore(capacity=2, eviction_policy="lru")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.get("a")
+    s.get("a")
+    s.set_eviction_policy("lfu")
+    s.set("c", "3")
+    assert s.get("b") is None
+    assert s.get("a") == "1"
+    assert s.stats()["eviction_policy"] == "lfu"
+    s.set_eviction_policy("lru")
+    assert s.stats()["eviction_policy"] == "lru"
+
+
+def test_lfu_snapshot_load_keeps_values(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=10, snapshot_path=path, eviction_policy="lfu")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.get("a")
+    s.get("a")
+    assert s.snapshot() == 2
+    restarted = KVStore(capacity=10, snapshot_path=path, eviction_policy="lfu")
+    assert restarted.load() == 2
+    assert restarted.get("a") == "1"
+    assert restarted.get("b") == "2"
+
+
+def test_lfu_loaded_keys_start_at_frequency_one(tmp_path):
+    path = tmp_path / "snap.json"
+    s = KVStore(capacity=3, snapshot_path=path, eviction_policy="lfu")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("c", "3")
+    s.snapshot()
+    restarted = KVStore(capacity=3, snapshot_path=path, eviction_policy="lfu")
+    restarted.load()
+    restarted.get("c")
+    restarted.get("c")
+    restarted.set("d", "4")
+    assert restarted.get("a") is None
+    assert restarted.get("c") == "3"
+
+
+def test_api_eviction_policy_switch():
+    r = client.post("/config/eviction-policy", json={"policy": "lfu"})
+    assert r.status_code == 200
+    assert r.json()["eviction_policy"] == "lfu"
+    assert client.get("/stats").json()["eviction_policy"] == "lfu"
+    r = client.post("/config/eviction-policy", json={"policy": "nope"})
+    assert r.status_code == 400
+    r = client.post("/config/eviction-policy", json={"policy": "lru"})
+    assert r.status_code == 200
+    assert client.get("/stats").json()["eviction_policy"] == "lru"
+
+
+def test_cluster_eviction_policy():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=("node-a", "node-b"), eviction_policy="lfu")
+    cluster.set("hello", "world")
+    assert cluster.get("hello") == "world"
+    assert all(
+        shard["eviction_policy"] == "lfu"
+        for shard in cluster.stats()["per_node"].values()
+    )
+    cluster.set_eviction_policy("lru")
+    assert all(
+        shard["eviction_policy"] == "lru"
+        for shard in cluster.stats()["per_node"].values()
+    )

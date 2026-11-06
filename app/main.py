@@ -1,4 +1,5 @@
-"""Day 3, HTTP API around the KV store, with disk persistence and sharding."""
+"""Day 4, HTTP API around the KV store, with disk persistence, sharding,
+and a switchable LRU and LFU eviction policy."""
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -16,6 +17,20 @@ cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"), capacity=1000)
 class SetRequest(BaseModel):
     value: str
     ttl_seconds: int | None = None
+
+
+class EvictionPolicyRequest(BaseModel):
+    policy: str
+
+
+@app.post("/config/eviction-policy")
+def set_eviction_policy(req: EvictionPolicyRequest):
+    try:
+        store.set_eviction_policy(req.policy)
+        cluster.set_eviction_policy(req.policy)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="policy must be lru or lfu")
+    return {"eviction_policy": req.policy}
 
 
 @app.put("/cache/{key}")
@@ -57,3 +72,4 @@ def cluster_route(key: str):
     if node is None:
         raise HTTPException(status_code=404, detail="No nodes available")
     return {"key": key, "node": node}
+

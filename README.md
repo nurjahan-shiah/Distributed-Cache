@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 3 is done, 2026-11-04. The project is finished when every item below is checked off.
+Day 4 is done, 2026-11-05. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -21,6 +21,9 @@ Day 3 is done, 2026-11-04. The project is finished when every item below is chec
 - Consistent hashing, keys route to one of three nodes through a ring
   with virtual nodes, `GET /cluster` shows per node sizes and
   `GET /cluster/route/{key}` shows which node owns a key
+- LFU eviction as an alternative to LRU, switchable at runtime with
+  `POST /config/eviction-policy`, frequencies tracked on every get and
+  set, ties broken by least recently used
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -40,7 +43,7 @@ pytest
 - [x] Day 1, Core store plus HTTP API, LRU, TTL, thread safety, tests
 - [x] Day 2, Persistence to disk, snapshot and load on startup, 2026-11-03
 - [x] Day 3, Consistent hashing, sharded nodes, 2026-11-04
-- [ ] Day 4, LFU eviction policy switch
+- [x] Day 4, LFU eviction policy switch, 2026-11-05
 - [ ] Day 5, Background TTL sweep
 - [ ] Day 6, Stats and health endpoints
 - [ ] Day 7, Concurrency benchmark, lock review
@@ -78,3 +81,17 @@ pytest
   topology change does not lose keys. An unplanned node loss still loses
   its keys, since there is no replication yet, and that is exactly what
   Day 10 is for.
+- Day 4 eviction design: every key carries an access count, incremented
+  on each get and on a set of an existing key, and LFU evicts the lowest
+  count, breaking ties by least recently used, which is the key's
+  position in the ordered dict. A brand new key starts at a frequency
+  of 1, so it can be evicted straight away when the cache is full of
+  hotter keys, which is the known LFU admission tradeoff, fixed in
+  production by admission policies such as TinyLFU. Frequencies are tracked in both modes,
+  so switching policy at runtime is instant and keeps the recorded
+  history, and deleting or expiring a key clears its count. The LFU
+  scan is O(n) per eviction, simple and correct at this scale, while a
+  production O(1) LFU would keep frequency buckets instead. Counts are
+  runtime state and are not stored in the snapshot, so loaded keys
+  start at a frequency of 1 after a restart.
+

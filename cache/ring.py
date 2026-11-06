@@ -55,3 +55,4 @@ class ConsistentHashRing:
 
     def nodes(self):
         return sorted(self._nodes)
+
