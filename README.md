@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 4 is done, 2026-11-05. The project is finished when every item below is checked off.
+Day 5 is done, 2026-11-07. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -24,6 +24,9 @@ Day 4 is done, 2026-11-05. The project is finished when every item below is chec
 - LFU eviction as an alternative to LRU, switchable at runtime with
   `POST /config/eviction-policy`, frequencies tracked on every get and
   set, ties broken by least recently used
+- Background TTL sweep, a daemon thread sweeps expired keys every 10
+  seconds on the store and on every cluster shard, `POST /sweep` runs
+  one on demand, and `/stats` reports keys swept and sweeps run
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -44,7 +47,7 @@ pytest
 - [x] Day 2, Persistence to disk, snapshot and load on startup, 2026-11-03
 - [x] Day 3, Consistent hashing, sharded nodes, 2026-11-04
 - [x] Day 4, LFU eviction policy switch, 2026-11-05
-- [ ] Day 5, Background TTL sweep
+- [x] Day 5, Background TTL sweep, 2026-11-07
 - [ ] Day 6, Stats and health endpoints
 - [ ] Day 7, Concurrency benchmark, lock review
 - [ ] Day 8, Batch get and set endpoints
@@ -94,4 +97,17 @@ pytest
   production O(1) LFU would keep frequency buckets instead. Counts are
   runtime state and are not stored in the snapshot, so loaded keys
   start at a frequency of 1 after a restart.
+- Day 5 sweep design: lazy expiry on get keeps reads correct, but a
+  key that is never read again would sit in memory until the store
+  fills, so a daemon thread sweeps expired keys every 10 seconds on
+  the store and on every cluster shard. The sweep takes the same lock
+  as reads and writes, so it never races a get or a set, and it stops
+  promptly because the thread waits on an event instead of sleeping.
+  Swept keys count in expired_swept, not in misses, since no read
+  failed. A sweep does not rewrite the snapshot, the snapshot still
+  holds the expired keys until the next write, but load already drops
+  expired entries, so a restart stays correct. The 10 second interval
+  is a demo default, a production cache would tune it against write
+  rate and memory pressure, or sweep in small batches to bound pause
+  time on a large store.
 

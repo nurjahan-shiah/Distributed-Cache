@@ -49,6 +49,28 @@ class ShardedStore:
             shard.set_eviction_policy(policy)
         self.eviction_policy = policy
 
+    def sweep_expired(self):
+        """Sweep expired keys on every shard, returns the total removed."""
+        return sum(shard.sweep_expired() for shard in self.shards.values())
+
+    def start_sweeper(self, interval_seconds=10):
+        """Start a background sweeper on every shard.
+
+        Returns True when at least one shard started a new sweeper.
+        """
+        started = [
+            shard.start_sweeper(interval_seconds) for shard in self.shards.values()
+        ]
+        return any(started)
+
+    def stop_sweeper(self):
+        """Stop the background sweeper on every shard.
+
+        Returns True when at least one shard stopped a running sweeper.
+        """
+        stopped = [shard.stop_sweeper() for shard in self.shards.values()]
+        return any(stopped)
+
     def add_node(self, node):
         if node in self.shards:
             return False

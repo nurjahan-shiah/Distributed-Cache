@@ -1,4 +1,5 @@
-"""Thread safe key value store with switchable LRU and LFU eviction, TTL expiry."""
+"""Thread safe key value store with switchable LRU and LFU eviction, TTL
+expiry, and a background sweeper that removes expired keys."""
 import json
 import threading
 import time
@@ -21,6 +22,10 @@ class KVStore:
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        self.expired_swept = 0
+        self.sweeps_run = 0
+        self._sweeper_thread = None
+        self._sweeper_stop = None
 
     def _is_expired(self, expires_at):
         return expires_at is not None and expires_at <= time.time()
@@ -93,6 +98,76 @@ class KVStore:
             self._freq.pop(key, None)
             return self._data.pop(key, None) is not None
 
+    def sweep_expired(self):
+        """Remove every expired entry in one pass under the lock.
+
+        Lazy expiry on get already keeps reads correct, but without a
+        sweep, keys that are never read again sit in memory until the
+        store fills up. A sweep reclaims that space proactively. It
+        counts as a sweep run, and the keys it removes are counted in
+        expired_swept, not in misses, since no read failed. Returns how
+        many entries were removed.
+        """
+        with self._lock:
+            now = time.time()
+            expired = [
+                key
+                for key, (_value, expires_at) in self._data.items()
+                if expires_at is not None and expires_at <= now
+            ]
+            for key in expired:
+                del self._data[key]
+                self._freq.pop(key, None)
+            self.expired_swept += len(expired)
+            self.sweeps_run += 1
+            return len(expired)
+
+    def start_sweeper(self, interval_seconds=10):
+        """Start a daemon thread that sweeps expired keys on an interval.
+
+        The thread waits on an event, so stop_sweeper wakes it at once
+        instead of waiting out the interval, and being a daemon thread
+        it never blocks process exit. Starting twice is a no-op and
+        returns False, the interval must be positive. Returns True when
+        a new sweeper thread was started.
+        """
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
+            return False
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._sweeper_loop,
+            args=(interval_seconds, stop),
+            daemon=True,
+        )
+        self._sweeper_stop = stop
+        self._sweeper_thread = thread
+        thread.start()
+        return True
+
+    def stop_sweeper(self):
+        """Stop the background sweeper, if one is running.
+
+        Returns True when a running sweeper was stopped, False when
+        none was running.
+        """
+        if self._sweeper_thread is None or not self._sweeper_thread.is_alive():
+            return False
+        self._sweeper_stop.set()
+        self._sweeper_thread.join(timeout=2)
+        self._sweeper_thread = None
+        self._sweeper_stop = None
+        return True
+
+    def _sweeper_loop(self, interval_seconds, stop):
+        while not stop.wait(interval_seconds):
+            self.sweep_expired()
+
+    @property
+    def sweeper_running(self):
+        return self._sweeper_thread is not None and self._sweeper_thread.is_alive()
+
     def entries(self):
         """Snapshot of live entries as (key, value, expires_at) triples.
 
@@ -118,6 +193,9 @@ class KVStore:
                 "hits": self.hits,
                 "misses": self.misses,
                 "evictions": self.evictions,
+                "expired_swept": self.expired_swept,
+                "sweeps_run": self.sweeps_run,
+                "sweeper_running": self.sweeper_running,
             }
 
     def snapshot(self):

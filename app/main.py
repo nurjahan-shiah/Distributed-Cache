@@ -1,5 +1,5 @@
-"""Day 4, HTTP API around the KV store, with disk persistence, sharding,
-and a switchable LRU and LFU eviction policy."""
+"""Day 5, HTTP API around the KV store, with disk persistence, sharding,
+a switchable LRU and LFU eviction policy, and a background TTL sweeper."""
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -11,7 +11,9 @@ from cache.store import KVStore
 app = FastAPI(title="Distributed Cache, KV Store")
 store = KVStore(capacity=1000, snapshot_path=Path("data/cache_snapshot.json"))
 store.load()
+store.start_sweeper(interval_seconds=10)
 cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"), capacity=1000)
+cluster.start_sweeper(interval_seconds=10)
 
 
 class SetRequest(BaseModel):
@@ -59,6 +61,14 @@ def delete_key(key: str):
 @app.get("/stats")
 def stats():
     return store.stats()
+
+
+@app.post("/sweep")
+def sweep():
+    """Run a TTL sweep on demand and report what it removed."""
+    removed = store.sweep_expired()
+    cluster.sweep_expired()
+    return {"removed": removed, "expired_swept": store.expired_swept}
 
 
 @app.get("/cluster")

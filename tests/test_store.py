@@ -352,3 +352,109 @@ def test_cluster_eviction_policy():
         shard["eviction_policy"] == "lru"
         for shard in cluster.stats()["per_node"].values()
     )
+
+
+def test_sweep_expired_removes_only_expired():
+    s = KVStore(capacity=10)
+    s.set("fresh", "1")
+    s.set("stale", "2", ttl_seconds=0.05)
+    s.set("also-stale", "3", ttl_seconds=0.05)
+    time.sleep(0.07)
+    assert s.sweep_expired() == 2
+    assert s.stats()["size"] == 1
+    assert s.get("fresh") == "1"
+    assert s.get("stale") is None
+
+
+def test_sweep_expired_counts_in_stats():
+    s = KVStore(capacity=10)
+    s.set("a", "1", ttl_seconds=0.05)
+    time.sleep(0.07)
+    s.sweep_expired()
+    assert s.stats()["expired_swept"] == 1
+    assert s.stats()["sweeps_run"] == 1
+    assert s.stats()["misses"] == 0
+    s.sweep_expired()
+    assert s.stats()["expired_swept"] == 1
+    assert s.stats()["sweeps_run"] == 2
+
+
+def test_background_sweeper_removes_expired_keys():
+    s = KVStore(capacity=10)
+    assert s.start_sweeper(interval_seconds=0.05) is True
+    try:
+        s.set("gone-soon", "1", ttl_seconds=0.05)
+        s.set("stays", "2")
+        time.sleep(0.3)
+        assert s.stats()["size"] == 1
+        assert s.get("stays") == "2"
+        assert s.stats()["expired_swept"] == 1
+    finally:
+        s.stop_sweeper()
+
+
+def test_sweeper_stop_halts_sweeping():
+    s = KVStore(capacity=10)
+    s.start_sweeper(interval_seconds=0.05)
+    assert s.stop_sweeper() is True
+    assert s.stop_sweeper() is False
+    s.set("expired-but-present", "1", ttl_seconds=0.05)
+    time.sleep(0.15)
+    assert s.stats()["size"] == 1
+    assert s.stats()["expired_swept"] == 0
+
+
+def test_start_sweeper_twice_is_noop():
+    s = KVStore(capacity=10)
+    try:
+        assert s.start_sweeper(interval_seconds=0.05) is True
+        assert s.start_sweeper(interval_seconds=0.05) is False
+        assert s.stats()["sweeper_running"] is True
+        with pytest.raises(ValueError):
+            KVStore(capacity=10).start_sweeper(interval_seconds=0)
+    finally:
+        s.stop_sweeper()
+    assert s.stats()["sweeper_running"] is False
+
+
+def test_cluster_sweep_expired():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"))
+    for i in range(30):
+        cluster.set(f"k{i}", str(i), ttl_seconds=0.05)
+    cluster.set("fresh", "1")
+    time.sleep(0.07)
+    assert cluster.sweep_expired() == 30
+    assert cluster.stats()["total_size"] == 1
+    assert cluster.get("fresh") == "1"
+
+
+def test_cluster_sweeper_runs_on_every_shard():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=("node-a", "node-b"))
+    try:
+        assert cluster.start_sweeper(interval_seconds=0.05) is True
+        cluster.set("gone-soon", "1", ttl_seconds=0.05)
+        time.sleep(0.3)
+        assert cluster.stats()["total_size"] == 0
+    finally:
+        cluster.stop_sweeper()
+
+
+def test_api_manual_sweep():
+    r = client.put("/cache/sweep-me", json={"value": "x", "ttl_seconds": 1})
+    assert r.status_code == 200
+    time.sleep(1.1)
+    r = client.post("/sweep")
+    assert r.status_code == 200
+    assert r.json()["expired_swept"] >= 1
+    assert client.get("/cache/sweep-me").status_code == 404
+
+
+def test_api_stats_reports_sweeper():
+    stats = client.get("/stats").json()
+    assert stats["sweeper_running"] is True
+    assert "expired_swept" in stats
+    assert "sweeps_run" in stats
