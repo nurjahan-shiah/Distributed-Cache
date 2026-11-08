@@ -120,9 +120,17 @@ class ShardedStore:
 
     def stats(self):
         per_node = {name: shard.stats() for name, shard in self.shards.items()}
+        total_hits = sum(s["hits"] for s in per_node.values())
+        total_misses = sum(s["misses"] for s in per_node.values())
+        reads = total_hits + total_misses
         return {
             "nodes": sorted(self.shards),
             "total_size": sum(s["size"] for s in per_node.values()),
+            "total_hits": total_hits,
+            "total_misses": total_misses,
+            "hit_rate": round(total_hits / reads, 4) if reads else 0.0,
+            "sweeper_running": bool(per_node)
+            and all(s["sweeper_running"] for s in per_node.values()),
             "per_node": per_node,
         }
 

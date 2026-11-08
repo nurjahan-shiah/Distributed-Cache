@@ -24,6 +24,7 @@ class KVStore:
         self.evictions = 0
         self.expired_swept = 0
         self.sweeps_run = 0
+        self.started_at = time.time()
         self._sweeper_thread = None
         self._sweeper_stop = None
 
@@ -185,17 +186,28 @@ class KVStore:
             return live
 
     def stats(self):
+        """Counters plus derived health figures.
+
+        hit_rate is hits over all reads, 0.0 before any read, so a fresh
+        store does not divide by zero. uptime_seconds is wall clock time
+        since this store was created, and started_at is the same moment
+        as an epoch timestamp.
+        """
         with self._lock:
+            reads = self.hits + self.misses
             return {
                 "size": len(self._data),
                 "capacity": self.capacity,
                 "eviction_policy": self.eviction_policy,
                 "hits": self.hits,
                 "misses": self.misses,
+                "hit_rate": round(self.hits / reads, 4) if reads else 0.0,
                 "evictions": self.evictions,
                 "expired_swept": self.expired_swept,
                 "sweeps_run": self.sweeps_run,
                 "sweeper_running": self.sweeper_running,
+                "started_at": self.started_at,
+                "uptime_seconds": round(time.time() - self.started_at, 3),
             }
 
     def snapshot(self):

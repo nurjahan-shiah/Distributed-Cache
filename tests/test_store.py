@@ -458,3 +458,88 @@ def test_api_stats_reports_sweeper():
     assert stats["sweeper_running"] is True
     assert "expired_swept" in stats
     assert "sweeps_run" in stats
+
+
+def test_stats_hit_rate():
+    s = KVStore(capacity=10)
+    assert s.stats()["hit_rate"] == 0.0
+    s.set("a", "1")
+    s.get("a")
+    s.get("a")
+    s.get("missing")
+    assert s.stats()["hit_rate"] == 0.6667
+    assert s.stats()["hits"] == 2
+    assert s.stats()["misses"] == 1
+
+
+def test_stats_uptime():
+    s = KVStore(capacity=10)
+    stats = s.stats()
+    assert stats["uptime_seconds"] >= 0
+    assert stats["uptime_seconds"] < 5
+    assert stats["started_at"] <= time.time()
+
+
+def test_health_endpoint():
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["uptime_seconds"] >= 0
+    assert body["started_at"].endswith("+00:00")
+    assert body["sweeper_running"] is True
+    assert body["cluster_nodes"] == 3
+    assert body["eviction_policy"] in ("lru", "lfu")
+
+
+def test_ready_endpoint():
+    r = client.get("/health/ready")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ready"
+    assert body["reason"] == "ok"
+    assert body["cluster_nodes"] == 3
+
+
+def test_readiness_fails_without_nodes():
+    from app.main import readiness
+    from cache.cluster import ShardedStore
+
+    s = KVStore(capacity=10)
+    empty = ShardedStore(nodes=())
+    ok, reason = readiness(s, empty)
+    assert ok is False
+    assert "no cluster nodes" in reason
+
+
+def test_readiness_fails_without_sweeper():
+    from app.main import readiness
+    from cache.cluster import ShardedStore
+
+    s = KVStore(capacity=10)
+    cluster = ShardedStore(nodes=("node-a",))
+    ok, reason = readiness(s, cluster)
+    assert ok is False
+    assert "sweeper" in reason
+
+
+def test_stats_includes_cluster_rollup():
+    cluster_stats = client.get("/stats").json()["cluster"]
+    assert cluster_stats["nodes"] == ["node-a", "node-b", "node-c"]
+    assert "total_size" in cluster_stats
+    assert "hit_rate" in cluster_stats
+    assert cluster_stats["sweeper_running"] is True
+    assert set(cluster_stats["per_node"]) == {"node-a", "node-b", "node-c"}
+
+
+def test_cluster_stats_hit_rate():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=("node-a", "node-b"))
+    cluster.set("a", "1")
+    cluster.get("a")
+    cluster.get("missing")
+    stats = cluster.stats()
+    assert stats["total_hits"] == 1
+    assert stats["total_misses"] == 1
+    assert stats["hit_rate"] == 0.5

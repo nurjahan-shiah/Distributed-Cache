@@ -1,8 +1,11 @@
-"""Day 5, HTTP API around the KV store, with disk persistence, sharding,
-a switchable LRU and LFU eviction policy, and a background TTL sweeper."""
+"""Day 6, HTTP API around the KV store, with disk persistence, sharding,
+a switchable LRU and LFU eviction policy, a background TTL sweeper, and
+stats and health endpoints."""
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from cache.cluster import ShardedStore
@@ -60,7 +63,71 @@ def delete_key(key: str):
 
 @app.get("/stats")
 def stats():
-    return store.stats()
+    result = store.stats()
+    result["cluster"] = cluster.stats()
+    return result
+
+
+def readiness(store, cluster):
+    """Readiness check for a store and a cluster.
+
+    Returns a (ready, reason) pair. The cache is ready when it has at
+    least one shard to route to and its background sweepers are running,
+    so expired keys do not pile up. A stopped sweeper or an empty
+    cluster means not ready, which the endpoint reports as a 503, not
+    a crash, so a load balancer can keep traffic away until it recovers.
+    """
+    if not cluster.shards:
+        return False, "no cluster nodes available"
+    if not store.sweeper_running:
+        return False, "store sweeper is not running"
+    if not all(shard.sweeper_running for shard in cluster.shards.values()):
+        return False, "a cluster shard sweeper is not running"
+    return True, "ok"
+
+
+@app.get("/health")
+def health():
+    """Liveness probe, cheap and always 200 while the process is up.
+
+    It reports uptime and current size, so an operator can tell the
+    process is alive and roughly how full it is, without waiting on
+    any slow dependency. Liveness never fails on a full or busy store,
+    only a dead process fails it.
+    """
+    stats = store.stats()
+    return {
+        "status": "ok",
+        "uptime_seconds": stats["uptime_seconds"],
+        "started_at": datetime.fromtimestamp(
+            store.started_at, tz=timezone.utc
+        ).isoformat(),
+        "size": stats["size"],
+        "capacity": stats["capacity"],
+        "eviction_policy": stats["eviction_policy"],
+        "sweeper_running": stats["sweeper_running"],
+        "cluster_nodes": len(cluster.shards),
+    }
+
+
+@app.get("/health/ready")
+def ready():
+    """Readiness probe, 200 when the cache can serve, 503 when not.
+
+    Readiness is stricter than liveness: a process can be alive but
+    not ready to take traffic, for example when its sweeper stopped
+    or its cluster has no nodes left.
+    """
+    ok, reason = readiness(store, cluster)
+    body = {
+        "status": "ready" if ok else "not_ready",
+        "reason": reason,
+        "cluster_nodes": len(cluster.shards),
+        "sweeper_running": store.sweeper_running,
+    }
+    if not ok:
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 @app.post("/sweep")

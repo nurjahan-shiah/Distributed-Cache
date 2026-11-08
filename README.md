@@ -7,13 +7,17 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 5 is done, 2026-11-07. The project is finished when every item below is checked off.
+Day 6 is done, 2026-11-08. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
 - `GET /cache/{key}`, returns 404 on a miss or an expired key
 - `DELETE /cache/{key}`
-- `GET /stats`, hits, misses, evictions, and current size
+- `GET /stats`, hits, misses, hit rate, evictions, current size, uptime,
+  and a cluster rollup with per node sizes and hit rate
+- `GET /health`, liveness probe, always 200 while the process is up
+- `GET /health/ready`, readiness probe, 200 when the cache can serve,
+  503 when a sweeper stopped or the cluster has no nodes
 - LRU eviction when the store is full, thread safe access with a lock
 - Disk persistence, the store snapshots to data/cache_snapshot.json on
   every write and delete, and loads that snapshot on startup, so keys
@@ -48,7 +52,7 @@ pytest
 - [x] Day 3, Consistent hashing, sharded nodes, 2026-11-04
 - [x] Day 4, LFU eviction policy switch, 2026-11-05
 - [x] Day 5, Background TTL sweep, 2026-11-07
-- [ ] Day 6, Stats and health endpoints
+- [x] Day 6, Stats and health endpoints, 2026-11-08
 - [ ] Day 7, Concurrency benchmark, lock review
 - [ ] Day 8, Batch get and set endpoints
 - [ ] Day 9, Compare and set
@@ -110,4 +114,15 @@ pytest
   is a demo default, a production cache would tune it against write
   rate and memory pressure, or sweep in small batches to bound pause
   time on a large store.
+- Day 6 health design: liveness and readiness are separate probes.
+  Liveness, `GET /health`, only says the process is alive, so it stays
+  200 even when the store is full or busy, and a load balancer restarts
+  the process only when liveness fails. Readiness, `GET /health/ready`,
+  says the cache can take traffic, so it returns 503 when the cluster
+  has no nodes or a sweeper stopped, and the load balancer keeps traffic
+  away until it recovers. Hit rate is hits over all reads, 0.0 before
+  any read, and it is reported per store and rolled up across the
+  cluster, so a single bad shard shows up in the total. Uptime is wall
+  clock time since the store was created, recorded at startup, so a
+  restart is visible as a reset uptime.
 
