@@ -27,6 +27,12 @@ class KVStore:
         self.started_at = time.time()
         self._sweeper_thread = None
         self._sweeper_stop = None
+        # Day 7 lock review: start and stop used to check and replace the
+        # sweeper thread with no lock, so two threads calling start at
+        # once could both pass the alive check and start two sweepers,
+        # leaking one that stop could never reach. This lock serializes
+        # the check and replace, so exactly one sweeper can start.
+        self._sweeper_lock = threading.Lock()
 
     def _is_expired(self, expires_at):
         return expires_at is not None and expires_at <= time.time()
@@ -130,35 +136,44 @@ class KVStore:
         instead of waiting out the interval, and being a daemon thread
         it never blocks process exit. Starting twice is a no-op and
         returns False, the interval must be positive. Returns True when
-        a new sweeper thread was started.
+        a new sweeper thread was started. The start check and the thread
+        creation hold the sweeper lock, so two threads starting at once
+        cannot both start a sweeper.
         """
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
-        if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
-            return False
-        stop = threading.Event()
-        thread = threading.Thread(
-            target=self._sweeper_loop,
-            args=(interval_seconds, stop),
-            daemon=True,
-        )
-        self._sweeper_stop = stop
-        self._sweeper_thread = thread
-        thread.start()
-        return True
+        with self._sweeper_lock:
+            if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
+                return False
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._sweeper_loop,
+                args=(interval_seconds, stop),
+                daemon=True,
+            )
+            self._sweeper_stop = stop
+            self._sweeper_thread = thread
+            thread.start()
+            return True
 
     def stop_sweeper(self):
         """Stop the background sweeper, if one is running.
 
         Returns True when a running sweeper was stopped, False when
-        none was running.
+        none was running. The thread reference is cleared under the
+        sweeper lock, then the stop event is set and the thread is
+        joined outside the lock, so a second stop racing this one sees
+        no thread and returns False instead of joining twice.
         """
-        if self._sweeper_thread is None or not self._sweeper_thread.is_alive():
-            return False
-        self._sweeper_stop.set()
-        self._sweeper_thread.join(timeout=2)
-        self._sweeper_thread = None
-        self._sweeper_stop = None
+        with self._sweeper_lock:
+            if self._sweeper_thread is None or not self._sweeper_thread.is_alive():
+                return False
+            stop = self._sweeper_stop
+            thread = self._sweeper_thread
+            self._sweeper_thread = None
+            self._sweeper_stop = None
+        stop.set()
+        thread.join(timeout=2)
         return True
 
     def _sweeper_loop(self, interval_seconds, stop):
@@ -167,7 +182,16 @@ class KVStore:
 
     @property
     def sweeper_running(self):
-        return self._sweeper_thread is not None and self._sweeper_thread.is_alive()
+        """True when a sweeper thread is alive.
+
+        The check takes the sweeper lock, so it never reads a thread
+        reference half replaced by a racing start or stop. stats() calls
+        this while holding the store lock, which is safe, because the
+        sweeper lock is never held while taking the store lock, so the
+        two locks always nest in the same order and cannot deadlock.
+        """
+        with self._sweeper_lock:
+            return self._sweeper_thread is not None and self._sweeper_thread.is_alive()
 
     def entries(self):
         """Snapshot of live entries as (key, value, expires_at) triples.

@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 6 is done, 2026-11-08. The project is finished when every item below is checked off.
+Day 7 is done, 2026-11-09. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -31,6 +31,10 @@ Day 6 is done, 2026-11-08. The project is finished when every item below is chec
 - Background TTL sweep, a daemon thread sweeps expired keys every 10
   seconds on the store and on every cluster shard, `POST /sweep` runs
   one on demand, and `/stats` reports keys swept and sweeps run
+- Concurrency benchmark, `python -m benchmarks.concurrency` measures
+  mixed get and set throughput for one store and for the cluster,
+  under disjoint and hot key workloads, and verifies no writes are
+  lost, with the lock review findings recorded below
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -53,7 +57,7 @@ pytest
 - [x] Day 4, LFU eviction policy switch, 2026-11-05
 - [x] Day 5, Background TTL sweep, 2026-11-07
 - [x] Day 6, Stats and health endpoints, 2026-11-08
-- [ ] Day 7, Concurrency benchmark, lock review
+- [x] Day 7, Concurrency benchmark, lock review, 2026-11-09
 - [ ] Day 8, Batch get and set endpoints
 - [ ] Day 9, Compare and set
 - [ ] Day 10, Replication, primary and replica sync
@@ -125,4 +129,33 @@ pytest
   cluster, so a single bad shard shows up in the total. Uptime is wall
   clock time since the store was created, recorded at startup, so a
   restart is visible as a reset uptime.
+- Day 7 lock review: one `threading.Lock` guards the whole store, so
+  every get, set, delete, sweep, and stats call serializes through it.
+  The benchmark, `python -m benchmarks.concurrency`, 75 percent writes
+  and 25 percent reads, measured about 563,000 ops/s single threaded,
+  about 609,000 ops/s with 8 threads on disjoint keys, and about
+  678,000 ops/s with 8 threads on 21 hot keys, all correct with no
+  lost writes. Threads add almost nothing on one store, because the
+  lock and the GIL serialize the work, so real scaling has to come
+  from sharding across processes or nodes, not from more threads. The
+  3 node cluster measured about 246,000 ops/s with 8 threads, slower
+  per op than one store, because every op pays an MD5 hash plus a
+  second lock, which is the honest cost of routing. The review found
+  and fixed three races: a sweeper start race, where two threads
+  starting a sweeper at once could both pass the alive check and leak
+  a second sweeper, now serialized by a dedicated sweeper lock; a ring
+  race, where a get_node racing a remove_node could bisect to a point
+  already popped from the map and raise KeyError, now guarded by a
+  ring lock; and cluster dict races, where a topology change could
+  resize the shard dict mid loop, now fixed by snapshotting the shards
+  under a topology lock and routing through it. One race is left on
+  purpose: a write racing a migration can land on a shard after
+  migration already moved its keys, so the write is lost. Fixing it
+  properly needs a read write lock, versioned routing, or quiesced
+  writes during topology changes, and pretending a plain lock fixes
+  it would be wrong. The hot workload uses 21 keys, not 20, because
+  20 shares a factor with the 4 step read pattern, so 5 of the 20 keys
+  would only ever be read and never set. Numbers were measured on the
+  dev machine, 2026-11-09, 8 threads, 1000 ops per thread, and will
+  differ on other hardware.
 

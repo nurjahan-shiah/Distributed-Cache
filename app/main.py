@@ -1,6 +1,7 @@
-"""Day 6, HTTP API around the KV store, with disk persistence, sharding,
-a switchable LRU and LFU eviction policy, a background TTL sweeper, and
-stats and health endpoints."""
+"""Day 7, HTTP API around the KV store, with disk persistence, sharding,
+a switchable LRU and LFU eviction policy, a background TTL sweeper,
+stats and health endpoints, and a concurrency benchmark with a lock
+review in benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,12 +77,15 @@ def readiness(store, cluster):
     so expired keys do not pile up. A stopped sweeper or an empty
     cluster means not ready, which the endpoint reports as a 503, not
     a crash, so a load balancer can keep traffic away until it recovers.
+    It reads the cluster through stats(), never the live shard dict,
+    so a topology change cannot resize the dict mid check.
     """
-    if not cluster.shards:
+    cluster_stats = cluster.stats()
+    if not cluster_stats["nodes"]:
         return False, "no cluster nodes available"
     if not store.sweeper_running:
         return False, "store sweeper is not running"
-    if not all(shard.sweeper_running for shard in cluster.shards.values()):
+    if not cluster_stats["sweeper_running"]:
         return False, "a cluster shard sweeper is not running"
     return True, "ok"
 
