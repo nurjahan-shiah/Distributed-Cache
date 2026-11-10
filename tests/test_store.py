@@ -543,3 +543,160 @@ def test_cluster_stats_hit_rate():
     assert stats["total_hits"] == 1
     assert stats["total_misses"] == 1
     assert stats["hit_rate"] == 0.5
+
+
+def test_get_many_returns_only_present_keys():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    s.set("b", "2")
+    assert s.get_many(["a", "b", "missing"]) == {"a": "1", "b": "2"}
+    assert s.get_many([]) == {}
+    assert s.get_many(["missing"]) == {}
+
+
+def test_get_many_counts_hits_and_misses_per_key():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    s.get_many(["a", "missing", "also-missing"])
+    assert s.stats()["hits"] == 1
+    assert s.stats()["misses"] == 2
+
+
+def test_get_many_drops_expired_keys():
+    s = KVStore(capacity=10)
+    s.set("fresh", "1")
+    s.set("stale", "2", ttl_seconds=0.05)
+    time.sleep(0.07)
+    assert s.get_many(["fresh", "stale"]) == {"fresh": "1"}
+    assert s.stats()["size"] == 1
+    assert s.stats()["misses"] == 1
+
+
+def test_get_many_reads_a_repeated_key_once():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    assert s.get_many(["a", "a", "a"]) == {"a": "1"}
+    assert s.stats()["hits"] == 1
+
+
+def test_set_many_sets_all_and_returns_count():
+    s = KVStore(capacity=10)
+    assert s.set_many({"a": "1", "b": "2", "c": "3"}) == 3
+    assert s.get_many(["a", "b", "c"]) == {"a": "1", "b": "2", "c": "3"}
+    assert s.set_many([("d", "4"), ("e", "5")]) == 2
+    assert s.get("d") == "4"
+    assert s.set_many({}) == 0
+
+
+def test_set_many_overwrites_and_applies_ttl():
+    s = KVStore(capacity=10)
+    s.set("a", "old")
+    s.set_many({"a": "new", "b": "2"}, ttl_seconds=0.05)
+    assert s.get("a") == "new"
+    time.sleep(0.07)
+    assert s.get("a") is None
+    assert s.get("b") is None
+
+
+def test_set_many_evicts_once_to_capacity():
+    s = KVStore(capacity=2)
+    s.set("a", "1")
+    s.set_many({"b": "2", "c": "3", "d": "4"})
+    assert s.stats()["size"] == 2
+    assert s.get("a") is None
+    assert s.get("b") is None
+    assert s.get("c") == "3"
+    assert s.get("d") == "4"
+
+
+def test_set_many_counts_as_access_for_lfu():
+    s = KVStore(capacity=2, eviction_policy="lfu")
+    s.set_many({"a": "1", "b": "2"})
+    s.get("a")
+    s.get("a")
+    s.set_many({"c": "3"})
+    assert s.get("b") is None
+    assert s.get("a") == "1"
+
+
+def test_batch_thread_safety():
+    s = KVStore(capacity=1000)
+    threads = [
+        threading.Thread(
+            target=lambda i=i: s.set_many({f"t{i}:k{j}": str(j) for j in range(100)})
+        )
+        for i in range(10)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert s.stats()["size"] == 1000
+    assert s.get("t3:k42") == "42"
+
+
+def test_cluster_get_many_and_set_many():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"))
+    assert cluster.set_many({f"k{i}": str(i) for i in range(100)}) == 100
+    assert cluster.get_many([f"k{i}" for i in range(100)]) == {
+        f"k{i}": str(i) for i in range(100)
+    }
+    assert cluster.get_many(["k0", "missing"]) == {"k0": "0"}
+    assert cluster.stats()["total_size"] == 100
+
+
+def test_cluster_batch_on_empty_cluster():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=())
+    assert cluster.set_many({"a": "1"}) == 0
+    assert cluster.get_many(["a"]) == {}
+
+
+def test_api_batch_get_and_set():
+    r = client.post(
+        "/cache/batch/set", json={"items": {"batch-a": "1", "batch-b": "2"}}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"set": 2, "keys": ["batch-a", "batch-b"]}
+    r = client.post(
+        "/cache/batch/get", json={"keys": ["batch-a", "batch-b", "batch-missing"]}
+    )
+    assert r.status_code == 200
+    assert r.json()["values"] == {"batch-a": "1", "batch-b": "2"}
+    assert r.json()["found"] == 2
+    assert r.json()["missing"] == ["batch-missing"]
+    assert client.get("/cache/batch-a").json()["value"] == "1"
+
+
+def test_api_batch_set_with_ttl():
+    r = client.post(
+        "/cache/batch/set",
+        json={"items": {"batch-ttl": "x"}, "ttl_seconds": 1},
+    )
+    assert r.status_code == 200
+    time.sleep(1.1)
+    r = client.post("/cache/batch/get", json={"keys": ["batch-ttl"]})
+    assert r.json()["values"] == {}
+    assert r.json()["missing"] == ["batch-ttl"]
+
+
+def test_api_batch_empty():
+    r = client.post("/cache/batch/get", json={"keys": []})
+    assert r.status_code == 200
+    assert r.json() == {"values": {}, "found": 0, "missing": []}
+    r = client.post("/cache/batch/set", json={"items": {}})
+    assert r.status_code == 200
+    assert r.json() == {"set": 0, "keys": []}
+
+
+def test_api_batch_size_limit():
+    big_keys = [f"limit-{i}" for i in range(1001)]
+    r = client.post("/cache/batch/get", json={"keys": big_keys})
+    assert r.status_code == 400
+    big_items = {f"limit-{i}": "x" for i in range(1001)}
+    r = client.post("/cache/batch/set", json={"items": big_items})
+    assert r.status_code == 400
+    assert client.get("/cache/limit-0").status_code == 404

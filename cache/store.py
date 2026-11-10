@@ -100,6 +100,58 @@ class KVStore:
             self.hits += 1
             return value
 
+    def get_many(self, keys):
+        """Get many keys at once, under one lock hold.
+
+        Returns a dict of the keys that were present and not
+        expired, in the order they were requested. Missing and
+        expired keys are left out, and expired keys are dropped,
+        just like a single get. Each found key counts as a hit and
+        each missing key as a miss, so stats stay consistent with
+        single gets. A repeated key in the request is read once.
+        """
+        found = {}
+        with self._lock:
+            for key in dict.fromkeys(keys):
+                item = self._data.get(key)
+                if item is None:
+                    self.misses += 1
+                    continue
+                value, expires_at = item
+                if self._is_expired(expires_at):
+                    del self._data[key]
+                    self._freq.pop(key, None)
+                    self.misses += 1
+                    continue
+                self._data.move_to_end(key)
+                self._freq[key] = self._freq.get(key, 0) + 1
+                self.hits += 1
+                found[key] = value
+        return found
+
+    def set_many(self, items, ttl_seconds=None):
+        """Set many keys at once, under one lock hold.
+
+        items is a dict of key to value, or an iterable of (key,
+        value) pairs. Every key gets the same TTL, and frequencies
+        update the same way as a single set, so LRU and LFU behave
+        the same as setting the keys one by one. Eviction runs once
+        at the end, not once per key, so the batch pays one eviction
+        pass instead of one per key. Returns how many keys were set.
+        """
+        pairs = list(items.items()) if isinstance(items, dict) else list(items)
+        expires_at = time.time() + ttl_seconds if ttl_seconds else None
+        with self._lock:
+            for key, value in pairs:
+                if key in self._data:
+                    del self._data[key]
+                    self._freq[key] = self._freq.get(key, 0) + 1
+                else:
+                    self._freq[key] = 1
+                self._data[key] = (value, expires_at)
+            self._evict_if_needed()
+        return len(pairs)
+
     def delete(self, key):
         with self._lock:
             self._freq.pop(key, None)

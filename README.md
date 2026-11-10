@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 7 is done, 2026-11-09. The project is finished when every item below is checked off.
+Day 8 is done, 2026-11-10. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -35,6 +35,11 @@ Day 7 is done, 2026-11-09. The project is finished when every item below is chec
   mixed get and set throughput for one store and for the cluster,
   under disjoint and hot key workloads, and verifies no writes are
   lost, with the lock review findings recorded below
+- Batch get and set, `POST /cache/batch/get` with a list of keys
+  returns the values found plus the keys that missed, and
+  `POST /cache/batch/set` with a dict of items sets them all in one
+  call, with one snapshot at the end, and both are capped at 1000
+  keys per request
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -58,7 +63,7 @@ pytest
 - [x] Day 5, Background TTL sweep, 2026-11-07
 - [x] Day 6, Stats and health endpoints, 2026-11-08
 - [x] Day 7, Concurrency benchmark, lock review, 2026-11-09
-- [ ] Day 8, Batch get and set endpoints
+- [x] Day 8, Batch get and set endpoints, 2026-11-10
 - [ ] Day 9, Compare and set
 - [ ] Day 10, Replication, primary and replica sync
 - [ ] Day 11, Config from environment, capacity and defaults
@@ -158,4 +163,21 @@ pytest
   would only ever be read and never set. Numbers were measured on the
   dev machine, 2026-11-09, 8 threads, 1000 ops per thread, and will
   differ on other hardware.
+- Day 8 batch design: a batch is one lock hold, not one lock hold
+  per key, so a 100 key batch pays one lock acquisition and one
+  eviction pass instead of 100 of each. `get_many` returns only the
+  keys that were found, and the endpoint adds the missing list, so
+  the caller can tell a miss from a key it never asked for, and a
+  repeated key in one request is read once. Each found key counts
+  as a hit and each missing key as a miss, so the stats stay
+  consistent with single gets. `set_many` gives every key the same
+  TTL and updates frequencies the same way a single set does, so
+  LRU and LFU behave the same as setting the keys one by one. The
+  cluster groups keys by shard first, so a batch spanning the
+  cluster still makes one call per shard. Batches are capped at
+  1000 keys, so one huge request cannot hold the store lock for a
+  long time, and the cap is a 400, not a silent truncation, so the
+  caller knows its batch did not run. The batch set snapshots once
+  at the end, which is the point of batching: one O(n) snapshot
+  instead of one per key.
 

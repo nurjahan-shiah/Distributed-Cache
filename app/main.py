@@ -1,7 +1,7 @@
-"""Day 7, HTTP API around the KV store, with disk persistence, sharding,
+"""Day 8, HTTP API around the KV store, with disk persistence, sharding,
 a switchable LRU and LFU eviction policy, a background TTL sweeper,
-stats and health endpoints, and a concurrency benchmark with a lock
-review in benchmarks/concurrency.py."""
+stats and health endpoints, batch get and set endpoints, and a
+concurrency benchmark with a lock review in benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +27,56 @@ class SetRequest(BaseModel):
 
 class EvictionPolicyRequest(BaseModel):
     policy: str
+
+
+MAX_BATCH_SIZE = 1000
+
+
+class BatchGetRequest(BaseModel):
+    keys: list[str]
+
+
+class BatchSetRequest(BaseModel):
+    items: dict[str, str]
+    ttl_seconds: int | None = None
+
+
+@app.post("/cache/batch/get")
+def batch_get(req: BatchGetRequest):
+    """Get many keys in one request.
+
+    Returns the values that were found, plus the keys that missed,
+    so the caller can tell a miss from a key it never asked for.
+    The batch is capped at MAX_BATCH_SIZE keys, so one huge request
+    cannot hold the store lock while the caller waits on it.
+    """
+    if len(req.keys) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"batch is limited to {MAX_BATCH_SIZE} keys",
+        )
+    values = store.get_many(req.keys)
+    missing = [key for key in dict.fromkeys(req.keys) if key not in values]
+    return {"values": values, "found": len(values), "missing": missing}
+
+
+@app.post("/cache/batch/set")
+def batch_set(req: BatchSetRequest):
+    """Set many keys in one request, with one snapshot at the end.
+
+    Every key gets the same TTL. The snapshot runs once for the
+    whole batch, not once per key, which is the point of batching:
+    one O(n) snapshot instead of one per key. The batch is capped
+    at MAX_BATCH_SIZE keys.
+    """
+    if len(req.items) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"batch is limited to {MAX_BATCH_SIZE} keys",
+        )
+    count = store.set_many(req.items, req.ttl_seconds)
+    store.snapshot()
+    return {"set": count, "keys": list(req.items)}
 
 
 @app.post("/config/eviction-policy")

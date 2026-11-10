@@ -165,6 +165,56 @@ class ShardedStore:
             return False
         return shard.delete(key)
 
+    def get_many(self, keys):
+        """Get many keys, grouped by shard, one call per shard.
+
+        Keys are grouped by their owning shard first, so a batch
+        that spans the cluster still makes one call per shard
+        instead of one call per key. Returns a dict of the keys
+        that were found, missing keys are left out, and keys with
+        no shard are skipped.
+        """
+        groups = []
+        for key in dict.fromkeys(keys):
+            shard = self._shard_for(key)
+            if shard is None:
+                continue
+            for group_shard, group_keys in groups:
+                if group_shard is shard:
+                    group_keys.append(key)
+                    break
+            else:
+                groups.append([shard, [key]])
+        found = {}
+        for shard, shard_keys in groups:
+            found.update(shard.get_many(shard_keys))
+        return found
+
+    def set_many(self, items, ttl_seconds=None):
+        """Set many keys, grouped by shard, one call per shard.
+
+        items is a dict of key to value, or an iterable of (key,
+        value) pairs. Every key gets the same TTL. Returns how many
+        keys were set, which is less than the batch size when the
+        cluster has no nodes to route some keys to.
+        """
+        pairs = list(items.items()) if isinstance(items, dict) else list(items)
+        groups = []
+        for key, value in pairs:
+            shard = self._shard_for(key)
+            if shard is None:
+                continue
+            for group_shard, group_pairs in groups:
+                if group_shard is shard:
+                    group_pairs.append((key, value))
+                    break
+            else:
+                groups.append([shard, [(key, value)]])
+        return sum(
+            shard.set_many(shard_pairs, ttl_seconds)
+            for shard, shard_pairs in groups
+        )
+
     def stats(self):
         snapshot = self._shards_snapshot()
         per_node = {name: shard.stats() for name, shard in snapshot}
