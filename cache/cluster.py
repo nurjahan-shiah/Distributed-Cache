@@ -215,6 +215,19 @@ class ShardedStore:
             for shard, shard_pairs in groups
         )
 
+    def compare_and_set(self, key, expected, value, ttl_seconds=None):
+        """Compare and set on the shard that owns the key.
+
+        Routing is the same as get and set, so the compare and the
+        write land on one shard, under that shard's lock, and stay
+        atomic. Returns False when the cluster has no nodes to route
+        to, otherwise the shard's result.
+        """
+        shard = self._shard_for(key)
+        if shard is None:
+            return False
+        return shard.compare_and_set(key, expected, value, ttl_seconds)
+
     def stats(self):
         snapshot = self._shards_snapshot()
         per_node = {name: shard.stats() for name, shard in snapshot}
@@ -227,6 +240,8 @@ class ShardedStore:
             "total_hits": total_hits,
             "total_misses": total_misses,
             "hit_rate": round(total_hits / reads, 4) if reads else 0.0,
+            "total_cas_success": sum(s["cas_success"] for s in per_node.values()),
+            "total_cas_failure": sum(s["cas_failure"] for s in per_node.values()),
             "sweeper_running": bool(per_node)
             and all(s["sweeper_running"] for s in per_node.values()),
             "per_node": per_node,

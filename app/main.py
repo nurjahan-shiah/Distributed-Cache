@@ -1,7 +1,8 @@
-"""Day 8, HTTP API around the KV store, with disk persistence, sharding,
+"""Day 9, HTTP API around the KV store, with disk persistence, sharding,
 a switchable LRU and LFU eviction policy, a background TTL sweeper,
-stats and health endpoints, batch get and set endpoints, and a
-concurrency benchmark with a lock review in benchmarks/concurrency.py."""
+stats and health endpoints, batch get and set endpoints, a compare
+and set endpoint, and a concurrency benchmark with a lock review in
+benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +40,31 @@ class BatchGetRequest(BaseModel):
 class BatchSetRequest(BaseModel):
     items: dict[str, str]
     ttl_seconds: int | None = None
+
+
+class CompareAndSetRequest(BaseModel):
+    key: str
+    expected: str | None = None
+    value: str
+    ttl_seconds: int | None = None
+
+
+@app.post("/cache/cas")
+def compare_and_set(req: CompareAndSetRequest):
+    """Set a key only when its current value matches expected.
+
+    expected=None means the key must be missing, so this also
+    creates a key only when nothing is there. A failed compare is
+    a 200 with success false, not an error, because the caller
+    asked a question and got an answer. Only a successful write
+    snapshots, a failed compare changed nothing.
+    """
+    success = store.compare_and_set(
+        req.key, req.expected, req.value, req.ttl_seconds
+    )
+    if success:
+        store.snapshot()
+    return {"key": req.key, "success": success}
 
 
 @app.post("/cache/batch/get")

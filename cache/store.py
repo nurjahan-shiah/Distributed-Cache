@@ -1,5 +1,6 @@
 """Thread safe key value store with switchable LRU and LFU eviction, TTL
-expiry, and a background sweeper that removes expired keys."""
+expiry, a background sweeper that removes expired keys, and an atomic
+compare and set."""
 import json
 import threading
 import time
@@ -24,6 +25,8 @@ class KVStore:
         self.evictions = 0
         self.expired_swept = 0
         self.sweeps_run = 0
+        self.cas_success = 0
+        self.cas_failure = 0
         self.started_at = time.time()
         self._sweeper_thread = None
         self._sweeper_stop = None
@@ -151,6 +154,56 @@ class KVStore:
                 self._data[key] = (value, expires_at)
             self._evict_if_needed()
         return len(pairs)
+
+    def compare_and_set(self, key, expected, value, ttl_seconds=None):
+        """Atomically set a key only when its current value matches.
+
+        The compare and the write happen under one lock hold, so no
+        other thread can slip a write in between, which is what makes
+        this safe for locks, leader election, and counters built on
+        retries. expected=None means the key must be missing, so it
+        creates the key only when nothing is there, and an expired key
+        counts as missing, so a stale lock can be reclaimed. On a
+        match, the value is replaced, and the TTL is replaced only
+        when ttl_seconds is given, otherwise the old expiry is kept.
+        A failed compare changes nothing, not even recency or
+        frequency, so a failed attempt cannot keep a cold key alive.
+        Frequencies update like a set on success. Returns True when
+        the value was written, False when the compare failed. A
+        successful write follows the same eviction rules as set, so
+        on a full LFU store a brand new cold key can still be evicted
+        right away, which is the admission tradeoff recorded on Day 4.
+        """
+        with self._lock:
+            item = self._data.get(key)
+            if item is not None:
+                _current, expires_at = item
+                if self._is_expired(expires_at):
+                    del self._data[key]
+                    self._freq.pop(key, None)
+                    item = None
+            if item is None:
+                if expected is not None:
+                    self.cas_failure += 1
+                    return False
+                expires_at = time.time() + ttl_seconds if ttl_seconds else None
+                self._data[key] = (value, expires_at)
+                self._freq[key] = 1
+                self._evict_if_needed()
+                self.cas_success += 1
+                return True
+            _current, expires_at = item
+            if _current != expected:
+                self.cas_failure += 1
+                return False
+            if ttl_seconds:
+                expires_at = time.time() + ttl_seconds
+            del self._data[key]
+            self._data[key] = (value, expires_at)
+            self._freq[key] = self._freq.get(key, 0) + 1
+            self._evict_if_needed()
+            self.cas_success += 1
+            return True
 
     def delete(self, key):
         with self._lock:
@@ -281,6 +334,8 @@ class KVStore:
                 "evictions": self.evictions,
                 "expired_swept": self.expired_swept,
                 "sweeps_run": self.sweeps_run,
+                "cas_success": self.cas_success,
+                "cas_failure": self.cas_failure,
                 "sweeper_running": self.sweeper_running,
                 "started_at": self.started_at,
                 "uptime_seconds": round(time.time() - self.started_at, 3),

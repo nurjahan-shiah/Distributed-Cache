@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 8 is done, 2026-11-10. The project is finished when every item below is checked off.
+Day 9 is done, 2026-11-11. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -40,6 +40,11 @@ Day 8 is done, 2026-11-10. The project is finished when every item below is chec
   `POST /cache/batch/set` with a dict of items sets them all in one
   call, with one snapshot at the end, and both are capped at 1000
   keys per request
+- Compare and set, `POST /cache/cas` with a key, an expected value,
+  and a new value, writes only when the current value matches, and
+  an expected value of null creates the key only when it is missing,
+  so it works as a lock or a counter primitive, with success and
+  failure counts in `/stats`
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -64,7 +69,7 @@ pytest
 - [x] Day 6, Stats and health endpoints, 2026-11-08
 - [x] Day 7, Concurrency benchmark, lock review, 2026-11-09
 - [x] Day 8, Batch get and set endpoints, 2026-11-10
-- [ ] Day 9, Compare and set
+- [x] Day 9, Compare and set, 2026-11-11
 - [ ] Day 10, Replication, primary and replica sync
 - [ ] Day 11, Config from environment, capacity and defaults
 - [ ] Day 12, Write ahead log for durability
@@ -180,4 +185,20 @@ pytest
   caller knows its batch did not run. The batch set snapshots once
   at the end, which is the point of batching: one O(n) snapshot
   instead of one per key.
+- Day 9 compare and set design: the compare and the write happen
+  under one lock hold, so no other thread can slip a write in
+  between, which is what makes CAS safe for locks, leader election,
+  and counters built on retries. An expected value of null means
+  the key must be missing, so CAS doubles as create if absent, and
+  an expired key counts as missing, so a stale lock can be
+  reclaimed. On a match the value is replaced, and the TTL is
+  replaced only when a new one is given, otherwise the old expiry
+  is kept, so a lock refresh does not silently extend a lease it
+  did not ask to extend. A failed compare changes nothing, not even
+  recency or frequency, so a failed attempt cannot keep a cold key
+  alive. Success and failure counts are in stats, and the cluster
+  routes a CAS to the owning shard, so it stays atomic on one
+  shard. A CAS is not a transaction across keys, and it does not
+  span shards, so a multi key atomic update still needs a lock or a
+  transaction layer on top.
 

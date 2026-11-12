@@ -700,3 +700,191 @@ def test_api_batch_size_limit():
     r = client.post("/cache/batch/set", json={"items": big_items})
     assert r.status_code == 400
     assert client.get("/cache/limit-0").status_code == 404
+
+
+def test_cas_succeeds_when_value_matches():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    assert s.compare_and_set("a", "1", "2") is True
+    assert s.get("a") == "2"
+
+
+def test_cas_fails_when_value_differs():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    assert s.compare_and_set("a", "other", "2") is False
+    assert s.get("a") == "1"
+
+
+def test_cas_fails_on_missing_key():
+    s = KVStore(capacity=10)
+    assert s.compare_and_set("missing", "1", "2") is False
+    assert s.get("missing") is None
+
+
+def test_cas_create_if_absent_with_expected_none():
+    s = KVStore(capacity=10)
+    assert s.compare_and_set("new", None, "1") is True
+    assert s.get("new") == "1"
+    assert s.compare_and_set("new", None, "2") is False
+    assert s.get("new") == "1"
+
+
+def test_cas_treats_expired_key_as_missing():
+    s = KVStore(capacity=10)
+    s.set("stale", "old", ttl_seconds=0.05)
+    time.sleep(0.07)
+    assert s.compare_and_set("stale", "old", "new") is False
+    assert s.compare_and_set("stale", None, "new") is True
+    assert s.get("stale") == "new"
+
+
+def test_cas_keeps_ttl_when_none_given():
+    s = KVStore(capacity=10)
+    s.set("a", "1", ttl_seconds=0.2)
+    assert s.compare_and_set("a", "1", "2") is True
+    time.sleep(0.25)
+    assert s.get("a") is None
+
+
+def test_cas_with_ttl_replaces_expiry():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    assert s.compare_and_set("a", "1", "2", ttl_seconds=0.05) is True
+    time.sleep(0.07)
+    assert s.get("a") is None
+
+
+def test_cas_counts_in_stats():
+    s = KVStore(capacity=10)
+    s.set("a", "1")
+    s.compare_and_set("a", "1", "2")
+    s.compare_and_set("a", "wrong", "3")
+    s.compare_and_set("missing", "x", "y")
+    stats = s.stats()
+    assert stats["cas_success"] == 1
+    assert stats["cas_failure"] == 2
+
+
+def test_cas_failure_does_not_touch_lru_order():
+    s = KVStore(capacity=2)
+    s.set("a", "1")
+    s.set("b", "2")
+    s.compare_and_set("a", "wrong", "9")
+    s.set("c", "3")
+    assert s.get("a") is None
+    assert s.get("b") == "2"
+    assert s.get("c") == "3"
+
+
+def test_cas_failure_does_not_touch_frequency():
+    s = KVStore(capacity=2, eviction_policy="lfu")
+    s.set("a", "1")
+    s.set("b", "2")
+    s.get("a")
+    s.compare_and_set("b", "wrong", "3")
+    s.set("c", "3")
+    assert s.get("b") is None
+    assert s.get("a") == "1"
+    assert s.get("c") == "3"
+
+
+def test_cas_is_atomic_under_threads():
+    s = KVStore(capacity=10)
+    s.set("counter", "0")
+    results = []
+    results_lock = threading.Lock()
+
+    def try_once():
+        ok = s.compare_and_set("counter", "0", "1")
+        with results_lock:
+            results.append(ok)
+
+    threads = [threading.Thread(target=try_once) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count(True) == 1
+    assert s.get("counter") == "1"
+
+
+def test_cas_counter_with_retries():
+    s = KVStore(capacity=10)
+    s.set("counter", "0")
+
+    def increment_many():
+        for _ in range(50):
+            while True:
+                current = s.get("counter")
+                if s.compare_and_set("counter", current, str(int(current) + 1)):
+                    break
+
+    threads = [threading.Thread(target=increment_many) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert s.get("counter") == "400"
+
+
+def test_cluster_compare_and_set():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"))
+    cluster.set("k1", "v1")
+    assert cluster.compare_and_set("k1", "v1", "v2") is True
+    assert cluster.get("k1") == "v2"
+    assert cluster.compare_and_set("k1", "v1", "v3") is False
+    assert cluster.get("k1") == "v2"
+    assert cluster.compare_and_set("fresh", None, "v") is True
+    assert cluster.get("fresh") == "v"
+    assert cluster.stats()["total_cas_success"] == 2
+    assert cluster.stats()["total_cas_failure"] == 1
+
+
+def test_cluster_compare_and_set_on_empty_cluster():
+    from cache.cluster import ShardedStore
+
+    cluster = ShardedStore(nodes=())
+    assert cluster.compare_and_set("a", "1", "2") is False
+
+
+def test_api_compare_and_set():
+    r = client.post(
+        "/cache/cas",
+        json={"key": "cas-a", "expected": "1", "value": "2"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"key": "cas-a", "success": False}
+    r = client.post(
+        "/cache/cas",
+        json={"key": "cas-a", "expected": None, "value": "1"},
+    )
+    assert r.json() == {"key": "cas-a", "success": True}
+    assert client.get("/cache/cas-a").json()["value"] == "1"
+    r = client.post(
+        "/cache/cas",
+        json={"key": "cas-a", "expected": "1", "value": "2"},
+    )
+    assert r.json() == {"key": "cas-a", "success": True}
+    assert client.get("/cache/cas-a").json()["value"] == "2"
+    r = client.post(
+        "/cache/cas",
+        json={"key": "cas-a", "expected": "1", "value": "3"},
+    )
+    assert r.json() == {"key": "cas-a", "success": False}
+    assert client.get("/cache/cas-a").json()["value"] == "2"
+
+
+def test_api_cas_success_snapshots():
+    from app.main import store as api_store
+
+    r = client.post(
+        "/cache/cas",
+        json={"key": "cas-snap", "expected": None, "value": "kept"},
+    )
+    assert r.json()["success"] is True
+    check = KVStore(capacity=1000, snapshot_path=api_store.snapshot_path)
+    assert check.load() >= 1
+    assert check.get("cas-snap") == "kept"
