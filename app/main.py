@@ -1,7 +1,8 @@
-"""Day 9, HTTP API around the KV store, with disk persistence, sharding,
+"""Day 10, HTTP API around the KV store, with disk persistence, sharding,
 a switchable LRU and LFU eviction policy, a background TTL sweeper,
 stats and health endpoints, batch get and set endpoints, a compare
-and set endpoint, and a concurrency benchmark with a lock review in
+and set endpoint, replication with primary and replica sync on the
+cluster, and a concurrency benchmark with a lock review in
 benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +18,9 @@ app = FastAPI(title="Distributed Cache, KV Store")
 store = KVStore(capacity=1000, snapshot_path=Path("data/cache_snapshot.json"))
 store.load()
 store.start_sweeper(interval_seconds=10)
-cluster = ShardedStore(nodes=("node-a", "node-b", "node-c"), capacity=1000)
+cluster = ShardedStore(
+    nodes=("node-a", "node-b", "node-c"), capacity=1000, replication_factor=2
+)
 cluster.start_sweeper(interval_seconds=10)
 
 
@@ -216,6 +219,98 @@ def sweep():
     removed = store.sweep_expired()
     cluster.sweep_expired()
     return {"removed": removed, "expired_swept": store.expired_swept}
+
+
+@app.get("/cluster/replication")
+def cluster_replication():
+    """Replication state for every node, plus a sync check per node.
+
+    Each node reports whether its primary is down, which replicas
+    are down, how many writes replicated or were skipped, and
+    whether its copies agree, with the verify detail showing any
+    missing, extra, or different keys per copy.
+    """
+    return cluster.replication_status()
+
+
+@app.post("/cluster/node/{node}/fail-primary")
+def failover_primary(node: str):
+    """Simulate a primary failure on one node and fail over.
+
+    Reads and writes for that node's keys move to its first healthy
+    replica. Returns failover false when the node is not replicated,
+    its primary is already down, or no replica is healthy enough to
+    serve, so the caller knows nothing changed.
+    """
+    if node not in cluster.shards:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    changed = cluster.fail_primary(node)
+    return {
+        "node": node,
+        "failover": changed,
+        "replication": cluster.replication_status()[node],
+    }
+
+
+@app.post("/cluster/node/{node}/recover-primary")
+def recover_primary_endpoint(node: str):
+    """Recover one node's primary and resync it from its replica.
+
+    The primary copies every live entry from the serving replica,
+    including writes that landed while it was down, and takes over
+    serving again. Returns recovered false when the primary was not
+    down or no replica could serve as the resync source.
+    """
+    if node not in cluster.shards:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    changed = cluster.recover_primary(node)
+    return {
+        "node": node,
+        "recovered": changed,
+        "replication": cluster.replication_status()[node],
+    }
+
+
+@app.post("/cluster/node/{node}/fail-replica/{index}")
+def failover_replica(node: str, index: int):
+    """Simulate one replica failing on one node, so writes skip it.
+
+    The replica keeps its data but stops receiving writes, and the
+    skipped writes are counted, until it is recovered and resynced.
+    """
+    if node not in cluster.shards:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    shard = cluster.shards[node]
+    if index < 0 or index >= len(getattr(shard, "replicas", [])):
+        raise HTTPException(status_code=400, detail="Replica index out of range")
+    changed = cluster.fail_replica(node, index)
+    return {
+        "node": node,
+        "replica": index,
+        "changed": changed,
+        "replication": cluster.replication_status()[node],
+    }
+
+
+@app.post("/cluster/node/{node}/recover-replica/{index}")
+def recover_replica_endpoint(node: str, index: int):
+    """Recover one replica on one node and resync it from the primary.
+
+    The replica copies every live entry from the serving copy and
+    starts receiving writes again.
+    """
+    if node not in cluster.shards:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    shard = cluster.shards[node]
+    if index < 0 or index >= len(getattr(shard, "replicas", [])):
+        raise HTTPException(status_code=400, detail="Replica index out of range")
+    changed = cluster.recover_replica(node, index)
+    return {
+        "node": node,
+        "replica": index,
+        "recovered": changed,
+        "replication": cluster.replication_status()[node],
+    }
 
 
 @app.get("/cluster")

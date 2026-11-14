@@ -1,5 +1,6 @@
 import threading
 import time
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -851,40 +852,47 @@ def test_cluster_compare_and_set_on_empty_cluster():
 
 
 def test_api_compare_and_set():
+    # A unique key per run, because the API store loads its snapshot
+    # on startup, so a fixed key could already exist from an earlier
+    # run, and the first compare would not see a missing key.
+    key = f"cas-a-{uuid.uuid4().hex[:8]}"
     r = client.post(
         "/cache/cas",
-        json={"key": "cas-a", "expected": "1", "value": "2"},
+        json={"key": key, "expected": "1", "value": "2"},
     )
     assert r.status_code == 200
-    assert r.json() == {"key": "cas-a", "success": False}
+    assert r.json() == {"key": key, "success": False}
     r = client.post(
         "/cache/cas",
-        json={"key": "cas-a", "expected": None, "value": "1"},
+        json={"key": key, "expected": None, "value": "1"},
     )
-    assert r.json() == {"key": "cas-a", "success": True}
-    assert client.get("/cache/cas-a").json()["value"] == "1"
+    assert r.json() == {"key": key, "success": True}
+    assert client.get(f"/cache/{key}").json()["value"] == "1"
     r = client.post(
         "/cache/cas",
-        json={"key": "cas-a", "expected": "1", "value": "2"},
+        json={"key": key, "expected": "1", "value": "2"},
     )
-    assert r.json() == {"key": "cas-a", "success": True}
-    assert client.get("/cache/cas-a").json()["value"] == "2"
+    assert r.json() == {"key": key, "success": True}
+    assert client.get(f"/cache/{key}").json()["value"] == "2"
     r = client.post(
         "/cache/cas",
-        json={"key": "cas-a", "expected": "1", "value": "3"},
+        json={"key": key, "expected": "1", "value": "3"},
     )
-    assert r.json() == {"key": "cas-a", "success": False}
-    assert client.get("/cache/cas-a").json()["value"] == "2"
+    assert r.json() == {"key": key, "success": False}
+    assert client.get(f"/cache/{key}").json()["value"] == "2"
 
 
 def test_api_cas_success_snapshots():
     from app.main import store as api_store
 
+    # A unique key per run, for the same snapshot reason as the test
+    # above: a fixed key could already exist from an earlier run.
+    key = f"cas-snap-{uuid.uuid4().hex[:8]}"
     r = client.post(
         "/cache/cas",
-        json={"key": "cas-snap", "expected": None, "value": "kept"},
+        json={"key": key, "expected": None, "value": "kept"},
     )
     assert r.json()["success"] is True
     check = KVStore(capacity=1000, snapshot_path=api_store.snapshot_path)
     assert check.load() >= 1
-    assert check.get("cas-snap") == "kept"
+    assert check.get(key) == "kept"

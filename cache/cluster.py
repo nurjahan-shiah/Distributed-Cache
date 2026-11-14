@@ -3,8 +3,16 @@
 Each node is a plain KVStore. The cluster owns the ring, so a caller
 never picks a node directly. When a node joins or leaves, keys whose
 owner changes are moved to their new owner, so a topology change does
-not silently lose keys. Replication is not here yet, that is Day 10,
-so a node that disappears without a clean remove still loses its keys.
+not silently lose keys.
+
+Day 10, replication: a node can be a ReplicatedShard instead of a
+plain KVStore, when the cluster is built with a replication factor
+above 1. Each node then holds a primary plus replica copies, so an
+unplanned primary failure on one node no longer loses its keys, the
+reads and writes fail over to a replica on the same node. A whole node
+disappearing without a clean remove still loses its keys, since the
+copies live on that node, and fixing that needs copies on other nodes,
+which is a later step.
 
 Day 7 lock review: three races were fixed here. Topology changes now
 hold one topology lock, so two add or remove calls cannot migrate at
@@ -21,19 +29,47 @@ topology change, or route by versioned epochs, instead of this.
 import threading
 import time
 
+from cache.replication import ReplicatedShard
 from cache.ring import ConsistentHashRing
 from cache.store import KVStore
 
 
 class ShardedStore:
-    def __init__(self, nodes=(), capacity=1000, replicas=100, eviction_policy="lru"):
+    def __init__(
+        self,
+        nodes=(),
+        capacity=1000,
+        replicas=100,
+        eviction_policy="lru",
+        replication_factor=1,
+    ):
+        if replication_factor < 1:
+            raise ValueError("replication_factor must be at least 1")
         self.capacity = capacity
         self.eviction_policy = eviction_policy
+        self.replication_factor = replication_factor
         self.ring = ConsistentHashRing(replicas=replicas)
         self.shards = {}
         self._topology_lock = threading.Lock()
         for node in nodes:
             self.add_node(node)
+
+    def _make_shard(self):
+        """Build one node's store, replicated when the factor is above 1.
+
+        A factor of 1 keeps the plain KVStore, so an unreplicated
+        cluster behaves exactly as it did before Day 10. A factor
+        above 1 builds a ReplicatedShard, one primary plus replicas,
+        behind the same method calls, so the rest of the cluster code
+        does not care which kind of shard it is talking to.
+        """
+        if self.replication_factor > 1:
+            return ReplicatedShard(
+                capacity=self.capacity,
+                replication_factor=self.replication_factor,
+                eviction_policy=self.eviction_policy,
+            )
+        return KVStore(capacity=self.capacity, eviction_policy=self.eviction_policy)
 
     def node_for(self, key):
         return self.ring.get_node(key)
@@ -120,9 +156,7 @@ class ShardedStore:
         with self._topology_lock:
             if node in self.shards:
                 return False
-            self.shards[node] = KVStore(
-                capacity=self.capacity, eviction_policy=self.eviction_policy
-            )
+            self.shards[node] = self._make_shard()
             self.ring.add_node(node)
             self._migrate_all()
             return True
@@ -228,6 +262,101 @@ class ShardedStore:
             return False
         return shard.compare_and_set(key, expected, value, ttl_seconds)
 
+    def _replicated_shard(self, node):
+        """The ReplicatedShard for a node, or None.
+
+        Returns None when the node is unknown or when the cluster
+        runs with a replication factor of 1, so its shards are plain
+        KVStores with no primary to fail over. Callers hold the
+        topology lock only when they need a stable lookup, this
+        helper takes it itself.
+        """
+        if self.replication_factor <= 1:
+            return None
+        with self._topology_lock:
+            shard = self.shards.get(node)
+        if not isinstance(shard, ReplicatedShard):
+            return None
+        return shard
+
+    def fail_primary(self, node):
+        """Fail over one node's primary to its first replica.
+
+        Returns False when the node is unknown, when the cluster is
+        not replicated, or when the shard refuses the failover,
+        because its primary is already down or no replica is healthy.
+        """
+        shard = self._replicated_shard(node)
+        if shard is None:
+            return False
+        return shard.fail_primary()
+
+    def recover_primary(self, node):
+        """Recover one node's primary and resync it from its replica.
+
+        Returns False when the node is unknown, when the cluster is
+        not replicated, or when the shard refuses the recover,
+        because its primary is not down or no replica can serve.
+        """
+        shard = self._replicated_shard(node)
+        if shard is None:
+            return False
+        return shard.recover_primary()
+
+    def fail_replica(self, node, index):
+        """Mark one replica down on one node, so writes skip it.
+
+        Returns False when the node is unknown, when the cluster is
+        not replicated, or when the shard refuses, because the index
+        is out of range or the replica is already down.
+        """
+        shard = self._replicated_shard(node)
+        if shard is None:
+            return False
+        return shard.fail_replica(index)
+
+    def recover_replica(self, node, index):
+        """Recover one replica on one node and resync it.
+
+        Returns False when the node is unknown, when the cluster is
+        not replicated, or when the shard refuses, because the index
+        is out of range or the replica is not down.
+        """
+        shard = self._replicated_shard(node)
+        if shard is None:
+            return False
+        return shard.recover_replica(index)
+
+    def replication_status(self):
+        """Replication state for every node, plus a sync check.
+
+        Replicated nodes report their counters and the result of
+        verify_sync, which compares each healthy copy against the
+        serving copy. Unreplicated nodes report a factor of 1 and an
+        empty verify, since a single copy is trivially in sync.
+        """
+        status = {}
+        for name, shard in self._shards_snapshot():
+            if isinstance(shard, ReplicatedShard):
+                entry = shard.replication_stats()
+                entry["verify"] = shard.verify_sync()
+            else:
+                entry = {
+                    "replication_factor": 1,
+                    "primary_down": False,
+                    "replicas_down": [],
+                    "healthy_replicas": 0,
+                    "replicated_writes": 0,
+                    "replication_skipped": 0,
+                    "writes_while_primary_down": 0,
+                    "failovers": 0,
+                    "resyncs": 0,
+                    "in_sync": True,
+                    "verify": {},
+                }
+            status[name] = entry
+        return status
+
     def stats(self):
         snapshot = self._shards_snapshot()
         per_node = {name: shard.stats() for name, shard in snapshot}
@@ -236,6 +365,7 @@ class ShardedStore:
         reads = total_hits + total_misses
         return {
             "nodes": sorted(per_node),
+            "replication_factor": self.replication_factor,
             "total_size": sum(s["size"] for s in per_node.values()),
             "total_hits": total_hits,
             "total_misses": total_misses,

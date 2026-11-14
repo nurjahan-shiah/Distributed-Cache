@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 9 is done, 2026-11-11. The project is finished when every item below is checked off.
+Day 10 is done, 2026-11-13. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -45,6 +45,13 @@ Day 9 is done, 2026-11-11. The project is finished when every item below is chec
   an expected value of null creates the key only when it is missing,
   so it works as a lock or a counter primitive, with success and
   failure counts in `/stats`
+- Replication, each cluster node holds a primary plus one replica,
+  every read and write applies to both copies, so they stay
+  identical, `GET /cluster/replication` shows per node sync state,
+  and `POST /cluster/node/{node}/fail-primary` fails over to the
+  replica while `POST /cluster/node/{node}/recover-primary` resyncs
+  the primary and brings it back, with the same pair of endpoints
+  for a single replica
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -70,7 +77,7 @@ pytest
 - [x] Day 7, Concurrency benchmark, lock review, 2026-11-09
 - [x] Day 8, Batch get and set endpoints, 2026-11-10
 - [x] Day 9, Compare and set, 2026-11-11
-- [ ] Day 10, Replication, primary and replica sync
+- [x] Day 10, Replication, primary and replica sync, 2026-11-13
 - [ ] Day 11, Config from environment, capacity and defaults
 - [ ] Day 12, Write ahead log for durability
 - [ ] Day 13, Eviction and memory limits, size tracking
@@ -201,4 +208,29 @@ pytest
   shard. A CAS is not a transaction across keys, and it does not
   span shards, so a multi key atomic update still needs a lock or a
   transaction layer on top.
+- Day 10 replication design: each cluster node is a primary plus
+  replicas, and every operation, read or write, applies to every
+  healthy copy under one shard lock, so the copies stay identical,
+  including LRU order and access frequencies, which is what keeps
+  eviction identical on all of them. A write returns only after
+  every healthy copy has it, so there is no replication lag, and a
+  read never sees a stale value from a replica. Failover is just
+  the serving copy moving down the list: fail_primary marks the
+  primary down and the first healthy replica serves, and while the
+  primary is down writes go to that replica and the primary is
+  flagged out of sync. Recover resyncs by copying every live entry
+  from the serving copy, deleting keys the target holds that the
+  source does not, so deletes that happened while it was down are
+  honoured, and TTLs are recomputed from the absolute expiry, so a
+  key keeps its original expiry. A down replica is skipped and
+  counted, not written to, and it resyncs the same way. The cost
+  is stated, not hidden: replicating reads costs one store op per
+  copy per read, which is slow next to reading one copy, and
+  production systems usually replicate writes only and accept lag
+  and eviction drift, so a failover there can turn a hit into a
+  miss. Copies live on the same node, so this fixes a primary
+  failure, not a whole node loss, which would need copies on other
+  nodes. verify_sync compares the serving copy against every
+  healthy copy and reports missing, extra, and different keys, so
+  the sync invariant is checked, not trusted.
 
