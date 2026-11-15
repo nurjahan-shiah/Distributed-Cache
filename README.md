@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 10 is done, 2026-11-13. The project is finished when every item below is checked off.
+Day 11 is done, 2026-11-15. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -52,6 +52,12 @@ Day 10 is done, 2026-11-13. The project is finished when every item below is che
   replica while `POST /cluster/node/{node}/recover-primary` resyncs
   the primary and brings it back, with the same pair of endpoints
   for a single replica
+- Config from environment, capacity, eviction policy, snapshot path,
+  sweep interval, node list, replication factor, ring replicas, and
+  max batch size all come from `CACHE_` variables, with the old
+  hardcoded values as defaults, and `GET /config` shows the
+  effective config plus whether each value came from the environment
+  or a default, while an invalid value fails fast at startup
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -60,6 +66,18 @@ Python, FastAPI, standard library only for the store itself.
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app
+```
+
+Config comes from the environment, all optional, with the defaults
+shown here. A `.env` file is not loaded, export the variables
+instead, and changing one needs a restart, since config is read once
+at startup.
+```bash
+CACHE_CAPACITY=1000 CACHE_EVICTION_POLICY=lru \
+CACHE_SNAPSHOT_PATH=data/cache_snapshot.json \
+CACHE_SWEEP_INTERVAL_SECONDS=10 CACHE_NODES=node-a,node-b,node-c \
+CACHE_REPLICATION_FACTOR=2 CACHE_RING_REPLICAS=100 \
+CACHE_MAX_BATCH_SIZE=1000 uvicorn app.main:app
 ```
 
 ## Run tests
@@ -78,7 +96,7 @@ pytest
 - [x] Day 8, Batch get and set endpoints, 2026-11-10
 - [x] Day 9, Compare and set, 2026-11-11
 - [x] Day 10, Replication, primary and replica sync, 2026-11-13
-- [ ] Day 11, Config from environment, capacity and defaults
+- [x] Day 11, Config from environment, capacity and defaults, 2026-11-15
 - [ ] Day 12, Write ahead log for durability
 - [ ] Day 13, Eviction and memory limits, size tracking
 - [ ] Day 14, Load test script and real benchmark numbers
@@ -233,4 +251,23 @@ pytest
   nodes. verify_sync compares the serving copy against every
   healthy copy and reports missing, extra, and different keys, so
   the sync invariant is checked, not trusted.
+- Day 11 config design: every tunable the app used to hardcode now
+  comes from a `CACHE_` variable, with the old hardcoded value kept
+  as the default, so a plain run with nothing set behaves exactly
+  as it did before Day 11. Config is read once at startup into a
+  frozen dataclass, so it cannot drift while the process runs, and
+  changing a variable needs a restart, which is the simple and
+  predictable choice for a cache, since resizing a live store would
+  mean deciding what to evict mid flight. Invalid values fail fast
+  with a ValueError naming the variable, so a typo like
+  CACHE_CAPACITY=abc stops startup instead of silently running
+  with the wrong size, and an empty value counts as unset, so an
+  empty export does not break a start. `GET /config` reports the
+  effective config plus a sources map, env or default per value,
+  so an operator can see what is actually running without guessing
+  which variable took effect. The config module takes a plain dict,
+  not os.environ directly, so tests inject a fake env without
+  touching global state. A `.env` file is not loaded, there is no
+  dotenv dependency, the variables must be exported, and `.env` is
+  in .gitignore so secrets never land in the repo by accident.
 

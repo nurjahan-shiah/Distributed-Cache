@@ -1,9 +1,9 @@
-"""Day 10, HTTP API around the KV store, with disk persistence, sharding,
+"""Day 11, HTTP API around the KV store, with disk persistence, sharding,
 a switchable LRU and LFU eviction policy, a background TTL sweeper,
 stats and health endpoints, batch get and set endpoints, a compare
 and set endpoint, replication with primary and replica sync on the
-cluster, and a concurrency benchmark with a lock review in
-benchmarks/concurrency.py."""
+cluster, config from environment variables, and a concurrency
+benchmark with a lock review in benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,16 +12,26 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from cache.cluster import ShardedStore
+from cache.config import load_config
 from cache.store import KVStore
 
 app = FastAPI(title="Distributed Cache, KV Store")
-store = KVStore(capacity=1000, snapshot_path=Path("data/cache_snapshot.json"))
-store.load()
-store.start_sweeper(interval_seconds=10)
-cluster = ShardedStore(
-    nodes=("node-a", "node-b", "node-c"), capacity=1000, replication_factor=2
+config = load_config()
+store = KVStore(
+    capacity=config.capacity,
+    snapshot_path=Path(config.snapshot_path),
+    eviction_policy=config.eviction_policy,
 )
-cluster.start_sweeper(interval_seconds=10)
+store.load()
+store.start_sweeper(interval_seconds=config.sweep_interval_seconds)
+cluster = ShardedStore(
+    nodes=config.nodes,
+    capacity=config.capacity,
+    replicas=config.ring_replicas,
+    eviction_policy=config.eviction_policy,
+    replication_factor=config.replication_factor,
+)
+cluster.start_sweeper(interval_seconds=config.sweep_interval_seconds)
 
 
 class SetRequest(BaseModel):
@@ -33,7 +43,7 @@ class EvictionPolicyRequest(BaseModel):
     policy: str
 
 
-MAX_BATCH_SIZE = 1000
+MAX_BATCH_SIZE = config.max_batch_size
 
 
 class BatchGetRequest(BaseModel):
@@ -116,6 +126,18 @@ def set_eviction_policy(req: EvictionPolicyRequest):
     except ValueError:
         raise HTTPException(status_code=400, detail="policy must be lru or lfu")
     return {"eviction_policy": req.policy}
+
+
+@app.get("/config")
+def get_config():
+    """The effective config this process started with.
+
+    Values come from the environment or from the defaults, and the
+    sources map says which, so an operator can check what is actually
+    running without guessing which variable took effect. Config is
+    read once at startup, so changing a variable needs a restart.
+    """
+    return config.to_dict()
 
 
 @app.put("/cache/{key}")
