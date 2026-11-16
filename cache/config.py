@@ -16,6 +16,9 @@ Variables, all optional:
     CACHE_REPLICATION_FACTOR, int, default 2.
     CACHE_RING_REPLICAS, int, default 100, virtual nodes per real node.
     CACHE_MAX_BATCH_SIZE, int, default 1000.
+    CACHE_WAL_PATH, path, default data/cache_wal.jsonl.
+    CACHE_WAL_CHECKPOINT_RECORDS, int, default 1000, writes before a
+    snapshot and log truncate.
 
 Invalid values fail fast with a ValueError at startup instead of
 silently falling back to a default. A typo like CACHE_CAPACITY=abc
@@ -69,6 +72,8 @@ class CacheConfig:
     replication_factor: int = 2
     ring_replicas: int = 100
     max_batch_size: int = 1000
+    wal_path: str = "data/cache_wal.jsonl"
+    wal_checkpoint_records: int = 1000
     sources: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -117,6 +122,10 @@ class CacheConfig:
         replication_factor = take("CACHE_REPLICATION_FACTOR", _parse_positive_int)
         ring_replicas = take("CACHE_RING_REPLICAS", _parse_positive_int)
         max_batch = take("CACHE_MAX_BATCH_SIZE", _parse_positive_int)
+        wal_path = take("CACHE_WAL_PATH")
+        wal_checkpoint = take(
+            "CACHE_WAL_CHECKPOINT_RECORDS", _parse_positive_int
+        )
 
         kwargs = {}
         if capacity is not None:
@@ -135,6 +144,10 @@ class CacheConfig:
             kwargs["ring_replicas"] = ring_replicas
         if max_batch is not None:
             kwargs["max_batch_size"] = max_batch
+        if wal_path is not None:
+            kwargs["wal_path"] = wal_path
+        if wal_checkpoint is not None:
+            kwargs["wal_checkpoint_records"] = wal_checkpoint
         kwargs["sources"] = {
             field_name: sources.get(env_name, "default")
             for field_name, env_name in _ENV_NAMES.items()
@@ -157,6 +170,8 @@ class CacheConfig:
             "replication_factor": self.replication_factor,
             "ring_replicas": self.ring_replicas,
             "max_batch_size": self.max_batch_size,
+            "wal_path": self.wal_path,
+            "wal_checkpoint_records": self.wal_checkpoint_records,
             "sources": dict(self.sources),
         }
 
@@ -170,6 +185,8 @@ _ENV_NAMES = {
     "replication_factor": "CACHE_REPLICATION_FACTOR",
     "ring_replicas": "CACHE_RING_REPLICAS",
     "max_batch_size": "CACHE_MAX_BATCH_SIZE",
+    "wal_path": "CACHE_WAL_PATH",
+    "wal_checkpoint_records": "CACHE_WAL_CHECKPOINT_RECORDS",
 }
 
 

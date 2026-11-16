@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 11 is done, 2026-11-15. The project is finished when every item below is checked off.
+Day 12 is done, 2026-11-16. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -19,9 +19,15 @@ Day 11 is done, 2026-11-15. The project is finished when every item below is che
 - `GET /health/ready`, readiness probe, 200 when the cache can serve,
   503 when a sweeper stopped or the cluster has no nodes
 - LRU eviction when the store is full, thread safe access with a lock
-- Disk persistence, the store snapshots to data/cache_snapshot.json on
-  every write and delete, and loads that snapshot on startup, so keys
-  survive a restart
+- Disk persistence, the store snapshots to data/cache_snapshot.json at
+  checkpoints and loads that snapshot on startup, so keys survive a
+  restart
+- Write ahead log, every mutation is appended to
+  data/cache_wal.jsonl and fsynced before it is applied, so a crash
+  never loses an acknowledged write, and on startup the log replays
+  after the snapshot, with `POST /checkpoint` writing a snapshot and
+  truncating the log on demand, and an automatic checkpoint after
+  1000 logged writes
 - Consistent hashing, keys route to one of three nodes through a ring
   with virtual nodes, `GET /cluster` shows per node sizes and
   `GET /cluster/route/{key}` shows which node owns a key
@@ -77,7 +83,8 @@ CACHE_CAPACITY=1000 CACHE_EVICTION_POLICY=lru \
 CACHE_SNAPSHOT_PATH=data/cache_snapshot.json \
 CACHE_SWEEP_INTERVAL_SECONDS=10 CACHE_NODES=node-a,node-b,node-c \
 CACHE_REPLICATION_FACTOR=2 CACHE_RING_REPLICAS=100 \
-CACHE_MAX_BATCH_SIZE=1000 uvicorn app.main:app
+CACHE_MAX_BATCH_SIZE=1000 CACHE_WAL_PATH=data/cache_wal.jsonl \
+CACHE_WAL_CHECKPOINT_RECORDS=1000 uvicorn app.main:app
 ```
 
 ## Run tests
@@ -97,7 +104,7 @@ pytest
 - [x] Day 9, Compare and set, 2026-11-11
 - [x] Day 10, Replication, primary and replica sync, 2026-11-13
 - [x] Day 11, Config from environment, capacity and defaults, 2026-11-15
-- [ ] Day 12, Write ahead log for durability
+- [x] Day 12, Write ahead log for durability, 2026-11-16
 - [ ] Day 13, Eviction and memory limits, size tracking
 - [ ] Day 14, Load test script and real benchmark numbers
 - [ ] Day 15, System design writeup, docs/system-design.md
@@ -148,7 +155,7 @@ pytest
   promptly because the thread waits on an event instead of sleeping.
   Swept keys count in expired_swept, not in misses, since no read
   failed. A sweep does not rewrite the snapshot, the snapshot still
-  holds the expired keys until the next write, but load already drops
+  holds the expired keys until the next checkpoint, but load already drops
   expired entries, so a restart stays correct. The 10 second interval
   is a demo default, a production cache would tune it against write
   rate and memory pressure, or sweep in small batches to bound pause
@@ -207,9 +214,9 @@ pytest
   cluster still makes one call per shard. Batches are capped at
   1000 keys, so one huge request cannot hold the store lock for a
   long time, and the cap is a 400, not a silent truncation, so the
-  caller knows its batch did not run. The batch set snapshots once
-  at the end, which is the point of batching: one O(n) snapshot
-  instead of one per key.
+  caller knows its batch did not run. The batch set logs one record,
+  which is the point of batching: one log record instead of one per
+  key, and the snapshot only happens at a checkpoint since Day 12.
 - Day 9 compare and set design: the compare and the write happen
   under one lock hold, so no other thread can slip a write in
   between, which is what makes CAS safe for locks, leader election,
@@ -270,4 +277,33 @@ pytest
   touching global state. A `.env` file is not loaded, there is no
   dotenv dependency, the variables must be exported, and `.env` is
   in .gitignore so secrets never land in the repo by accident.
+- Day 12 write ahead log design: a mutation is appended to the log
+  and fsynced before it is applied in memory, so the log is the
+  durability path and the snapshot is only a checkpoint, which fixes
+  the O(n) snapshot per write cost recorded on Day 2, since a write
+  now costs one small append plus fsync instead of rewriting the
+  whole store. Records are one JSON object per line, stamped with a
+  sequence number that only ever rises, and the snapshot records the
+  last seq it contains, so replay after a load skips records the
+  snapshot already holds. That seq is what makes the crash window
+  between a snapshot write and a log truncate safe: replaying a
+  record twice would re-add a key the snapshot already has, and
+  could evict a different key than the live run did. A checkpoint
+  snapshots and truncates under the same lock hold, so no write can
+  slip in between and be lost, and the store lock became an RLock
+  so a checkpoint triggered inside a mutation can snapshot while
+  the mutation holds it, with the tradeoff that writers pause
+  briefly while the snapshot file is written. A batch is one log
+  record, so a torn write drops the whole batch instead of half
+  applying it, and a torn last line is truncated on open, so it
+  never replays and never blocks a later append. Sweep removals are
+  not logged, replay drops expired sets by their absolute expiry,
+  and only successful writes are logged, so a failed compare and
+  set and a delete of a missing key add nothing to the log. The
+  cluster shards still have no log, they were never persisted, so
+  the log covers the single store behind the API, and giving each
+  shard its own log is a later step. The fsync per write is the
+  honest cost of durability on one disk, and production systems
+  usually group commit or fsync on a timer to trade a little
+  durability for throughput.
 

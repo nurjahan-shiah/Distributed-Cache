@@ -1,25 +1,64 @@
 """Thread safe key value store with switchable LRU and LFU eviction, TTL
-expiry, a background sweeper that removes expired keys, and an atomic
-compare and set."""
+expiry, a background sweeper that removes expired keys, an atomic
+compare and set, and a write ahead log for durability.
+
+Every mutation is written to the log and fsynced before it is applied
+in memory, so a crash never loses an acknowledged write. On startup,
+load() reads the snapshot and then replays the log, so keys written
+since the last checkpoint come back. A checkpoint writes a snapshot
+and truncates the log, which bounds replay and log size.
+"""
 import json
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
 
+from cache.wal import WriteAheadLog
+
 POLICIES = ("lru", "lfu")
 
 
 class KVStore:
-    def __init__(self, capacity=1000, snapshot_path=None, eviction_policy="lru"):
+    def __init__(
+        self,
+        capacity=1000,
+        snapshot_path=None,
+        eviction_policy="lru",
+        wal_path=None,
+        wal_checkpoint_records=1000,
+    ):
         if eviction_policy not in POLICIES:
             raise ValueError("eviction_policy must be lru or lfu")
+        if wal_checkpoint_records <= 0:
+            raise ValueError("wal_checkpoint_records must be positive")
         self.capacity = capacity
         self.snapshot_path = Path(snapshot_path) if snapshot_path else None
         self.eviction_policy = eviction_policy
+        self.wal_path = Path(wal_path) if wal_path else None
+        self.wal_checkpoint_records = wal_checkpoint_records
+        self.wal = WriteAheadLog(self.wal_path) if self.wal_path else None
+        self.wal_records = 0
+        self.wal_replayed = 0
+        self.checkpoints = 0
+        if self.wal is not None:
+            # A snapshot can hold a higher seq than the log file
+            # shows, when the log was truncated at a checkpoint and
+            # the process restarted, so new records must start above
+            # the snapshot seq, or replay would skip them as already
+            # snapshotted. load() repeats this after reading the
+            # snapshot, this covers writes before any load() call.
+            self.wal.next_seq = max(
+                self.wal.next_seq, self._snapshot_wal_seq() + 1
+            )
         self._data = OrderedDict()
         self._freq = {}
-        self._lock = threading.Lock()
+        # Day 12: a plain Lock would deadlock when a checkpoint runs
+        # inside a mutation, because checkpoint snapshots while the
+        # mutation already holds the lock. An RLock lets the same
+        # thread re-enter, and no other thread can hold it at the
+        # same time, so the lock still serializes every operation.
+        self._lock = threading.RLock()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
@@ -75,9 +114,70 @@ class KVStore:
                 self._freq.pop(victim, None)
             self.evictions += 1
 
+    def _append_wal(self, record):
+        """Append a record to the write ahead log, if one is configured.
+
+        Callers hold the lock, and the record is written and fsynced
+        before the mutation is applied, so a crash after the fsync
+        never loses the write. Returns the seq, or None with no WAL.
+        Raises OSError when the write fails, and the caller must not
+        apply the mutation.
+        """
+        if self.wal is None:
+            return None
+        seq = self.wal.append(record)
+        self.wal_records += 1
+        return seq
+
+    def _maybe_checkpoint(self):
+        """Checkpoint when the log has grown past its limit.
+
+        Callers hold the lock, and call this after the mutation is
+        applied, so the snapshot includes every logged record. The
+        snapshot and the truncate happen under the same lock hold, so
+        no write can slip in between them and be lost.
+        """
+        if self.wal is None:
+            return
+        if self.wal_records < self.wal_checkpoint_records:
+            return
+        self._checkpoint_locked()
+
+    def _checkpoint_locked(self):
+        """Snapshot and truncate the log. Callers hold the lock.
+
+        Returns how many entries the snapshot saved.
+        """
+        entries = self.snapshot()
+        self.wal.truncate()
+        self.wal_records = 0
+        self.checkpoints += 1
+        return entries
+
+    def checkpoint(self):
+        """Write a snapshot and truncate the write ahead log.
+
+        After this, the snapshot holds every key and the log is
+        empty, so a restart replays nothing. Returns how many
+        entries the snapshot saved. With no WAL configured this is
+        just a snapshot.
+        """
+        with self._lock:
+            if self.wal is None:
+                return self.snapshot()
+            return self._checkpoint_locked()
+
     def set(self, key, value, ttl_seconds=None):
         expires_at = time.time() + ttl_seconds if ttl_seconds else None
         with self._lock:
+            self._append_wal(
+                {
+                    "op": "set",
+                    "key": key,
+                    "value": value,
+                    "expires_at": expires_at,
+                }
+            )
             if key in self._data:
                 del self._data[key]
                 self._freq[key] = self._freq.get(key, 0) + 1
@@ -85,6 +185,7 @@ class KVStore:
                 self._freq[key] = 1
             self._data[key] = (value, expires_at)
             self._evict_if_needed()
+            self._maybe_checkpoint()
 
     def get(self, key):
         with self._lock:
@@ -145,6 +246,16 @@ class KVStore:
         pairs = list(items.items()) if isinstance(items, dict) else list(items)
         expires_at = time.time() + ttl_seconds if ttl_seconds else None
         with self._lock:
+            if pairs:
+                # One record for the whole batch, so a torn write
+                # drops the batch instead of half applying it.
+                self._append_wal(
+                    {
+                        "op": "set_many",
+                        "items": dict(pairs),
+                        "expires_at": expires_at,
+                    }
+                )
             for key, value in pairs:
                 if key in self._data:
                     del self._data[key]
@@ -153,6 +264,7 @@ class KVStore:
                     self._freq[key] = 1
                 self._data[key] = (value, expires_at)
             self._evict_if_needed()
+            self._maybe_checkpoint()
         return len(pairs)
 
     def compare_and_set(self, key, expected, value, ttl_seconds=None):
@@ -187,10 +299,22 @@ class KVStore:
                     self.cas_failure += 1
                     return False
                 expires_at = time.time() + ttl_seconds if ttl_seconds else None
+                # A successful write is logged as a plain set, so
+                # replay restores it, and a failed compare logs
+                # nothing, so replay never invents a key.
+                self._append_wal(
+                    {
+                        "op": "set",
+                        "key": key,
+                        "value": value,
+                        "expires_at": expires_at,
+                    }
+                )
                 self._data[key] = (value, expires_at)
                 self._freq[key] = 1
                 self._evict_if_needed()
                 self.cas_success += 1
+                self._maybe_checkpoint()
                 return True
             _current, expires_at = item
             if _current != expected:
@@ -198,17 +322,33 @@ class KVStore:
                 return False
             if ttl_seconds:
                 expires_at = time.time() + ttl_seconds
+            self._append_wal(
+                {
+                    "op": "set",
+                    "key": key,
+                    "value": value,
+                    "expires_at": expires_at,
+                }
+            )
             del self._data[key]
             self._data[key] = (value, expires_at)
             self._freq[key] = self._freq.get(key, 0) + 1
             self._evict_if_needed()
             self.cas_success += 1
+            self._maybe_checkpoint()
             return True
 
     def delete(self, key):
         with self._lock:
+            if key not in self._data:
+                return False
+            # Only a delete that removes something is logged, so the
+            # log never grows on deletes of missing keys.
+            self._append_wal({"op": "delete", "key": key})
             self._freq.pop(key, None)
-            return self._data.pop(key, None) is not None
+            del self._data[key]
+            self._maybe_checkpoint()
+            return True
 
     def sweep_expired(self):
         """Remove every expired entry in one pass under the lock.
@@ -336,6 +476,10 @@ class KVStore:
                 "sweeps_run": self.sweeps_run,
                 "cas_success": self.cas_success,
                 "cas_failure": self.cas_failure,
+                "wal_path": str(self.wal_path) if self.wal_path else None,
+                "wal_records": self.wal_records,
+                "wal_replayed": self.wal_replayed,
+                "checkpoints": self.checkpoints,
                 "sweeper_running": self.sweeper_running,
                 "started_at": self.started_at,
                 "uptime_seconds": round(time.time() - self.started_at, 3),
@@ -347,8 +491,11 @@ class KVStore:
         The copy is taken under the lock, then written to a temp file in
         the same directory and renamed over the snapshot. A crash mid
         write therefore leaves either the old snapshot or the new one,
-        never a half written file. Returns how many entries were saved,
-        or 0 when no snapshot path is configured.
+        never a half written file. The file also records the WAL seq
+        of the last record included in the snapshot, so replay after
+        a load skips records the snapshot already holds. Returns how
+        many entries were saved, or 0 when no snapshot path is
+        configured.
         """
         if not self.snapshot_path:
             return 0
@@ -358,22 +505,20 @@ class KVStore:
                 for k, (v, e) in self._data.items()
                 if not self._is_expired(e)
             }
+            wal_seq = self.wal.last_seq if self.wal is not None else 0
+        payload = {"_snapshot_format": 2, "wal_seq": wal_seq, "entries": data}
         self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.snapshot_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(data))
+        tmp_path.write_text(json.dumps(payload))
         tmp_path.replace(self.snapshot_path)
         return len(data)
 
-    def load(self):
-        """Load a snapshot written by snapshot(), if one exists.
+    def _snapshot_wal_seq(self):
+        """The WAL seq recorded in the snapshot file, best effort.
 
-        Expired entries are dropped, malformed entries are skipped, and
-        a missing or corrupt snapshot leaves the store empty instead of
-        failing startup. Capacity is enforced in the current policy's
-        eviction order, so a snapshot larger than capacity still loads
-        cleanly. Access frequencies are runtime state and are not stored
-        in the snapshot, so loaded keys start at a frequency of 1.
-        Returns how many entries were loaded.
+        Returns 0 when there is no snapshot, when it is corrupt, or
+        when it was written before snapshots carried a seq. Used to
+        keep new WAL seqs above the snapshot seq after a restart.
         """
         if not self.snapshot_path or not self.snapshot_path.exists():
             return 0
@@ -383,19 +528,115 @@ class KVStore:
             return 0
         if not isinstance(data, dict):
             return 0
-        loaded = 0
+        if data.get("_snapshot_format") != 2:
+            return 0
+        wal_seq = data.get("wal_seq", 0)
+        return wal_seq if isinstance(wal_seq, int) else 0
+
+    def _replay_wal(self, snapshot_seq):
+        """Apply WAL records newer than the snapshot, in file order.
+
+        Callers hold the lock. Records at or below the snapshot seq
+        are already in the snapshot and are skipped, expired sets are
+        dropped, deletes remove the key, and capacity is enforced as
+        records apply. A record missing the fields its op needs is
+        skipped, so a corrupt record can never crash startup. The
+        log keeps the new seqs above the snapshot seq, so a later
+        write is never skipped as already snapshotted. Returns how
+        many records were applied.
+        """
+        if self.wal is None:
+            return 0
+        self.wal.next_seq = max(self.wal.next_seq, snapshot_seq + 1)
+        records = self.wal.replay()
+        applied = 0
         with self._lock:
-            for key, item in data.items():
-                if not isinstance(item, dict):
+            for seq, record in records:
+                if seq <= snapshot_seq:
                     continue
-                if "value" not in item or "expires_at" not in item:
-                    continue
-                if self._is_expired(item["expires_at"]):
-                    continue
-                if key in self._data:
-                    del self._data[key]
-                self._data[key] = (item["value"], item["expires_at"])
-                self._freq[key] = 1
-                loaded += 1
-                self._evict_if_needed()
+                op = record.get("op")
+                if op == "set":
+                    if "key" not in record or "value" not in record:
+                        continue
+                    if self._is_expired(record.get("expires_at")):
+                        continue
+                    key = record["key"]
+                    if key in self._data:
+                        del self._data[key]
+                    self._data[key] = (record["value"], record.get("expires_at"))
+                    self._freq[key] = 1
+                    applied += 1
+                    self._evict_if_needed()
+                elif op == "set_many":
+                    items = record.get("items")
+                    if not isinstance(items, dict):
+                        continue
+                    if self._is_expired(record.get("expires_at")):
+                        continue
+                    for key, value in items.items():
+                        if key in self._data:
+                            del self._data[key]
+                        self._data[key] = (value, record.get("expires_at"))
+                        self._freq[key] = 1
+                        applied += 1
+                    self._evict_if_needed()
+                elif op == "delete":
+                    if "key" not in record:
+                        continue
+                    self._data.pop(record["key"], None)
+                    self._freq.pop(record["key"], None)
+                    applied += 1
+        self.wal_replayed = applied
+        return applied
+
+    def load(self):
+        """Load a snapshot written by snapshot(), then replay the WAL.
+
+        Expired entries are dropped, malformed entries are skipped, and
+        a missing or corrupt snapshot leaves the store empty instead of
+        failing startup. Capacity is enforced in the current policy's
+        eviction order, so a snapshot larger than capacity still loads
+        cleanly. Access frequencies are runtime state and are not stored
+        in the snapshot, so loaded keys start at a frequency of 1.
+        Snapshots written before Day 12 carry no WAL seq and load as
+        holding seq 0, so every WAL record replays. Returns how many
+        entries the snapshot loaded plus how many WAL records were
+        replayed. Call this once at startup, before serving writes,
+        so new WAL seqs start above the snapshot seq.
+        """
+        loaded = 0
+        snapshot_seq = 0
+        if self.snapshot_path and self.snapshot_path.exists():
+            try:
+                data = json.loads(self.snapshot_path.read_text())
+            except (ValueError, OSError):
+                data = None
+            if isinstance(data, dict):
+                if data.get("_snapshot_format") == 2 and isinstance(
+                    data.get("entries"), dict
+                ):
+                    snapshot_seq = data.get("wal_seq", 0)
+                    if not isinstance(snapshot_seq, int) or isinstance(
+                        snapshot_seq, bool
+                    ):
+                        snapshot_seq = 0
+                    entries = data["entries"]
+                else:
+                    entries = data
+                with self._lock:
+                    for key, item in entries.items():
+                        if not isinstance(item, dict):
+                            continue
+                        if "value" not in item or "expires_at" not in item:
+                            continue
+                        if self._is_expired(item["expires_at"]):
+                            continue
+                        if key in self._data:
+                            del self._data[key]
+                        self._data[key] = (item["value"], item["expires_at"])
+                        self._freq[key] = 1
+                        loaded += 1
+                        self._evict_if_needed()
+        if self.wal is not None:
+            loaded += self._replay_wal(snapshot_seq)
         return loaded

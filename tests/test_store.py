@@ -882,17 +882,23 @@ def test_api_compare_and_set():
     assert client.get(f"/cache/{key}").json()["value"] == "2"
 
 
-def test_api_cas_success_snapshots():
+def test_api_cas_success_is_recovered_from_wal():
     from app.main import store as api_store
 
     # A unique key per run, for the same snapshot reason as the test
     # above: a fixed key could already exist from an earlier run.
+    # Day 12: a successful CAS is logged to the write ahead log, not
+    # snapshotted, so the check store replays the log to find it.
     key = f"cas-snap-{uuid.uuid4().hex[:8]}"
     r = client.post(
         "/cache/cas",
         json={"key": key, "expected": None, "value": "kept"},
     )
     assert r.json()["success"] is True
-    check = KVStore(capacity=1000, snapshot_path=api_store.snapshot_path)
+    check = KVStore(
+        capacity=1000,
+        snapshot_path=api_store.snapshot_path,
+        wal_path=api_store.wal_path,
+    )
     assert check.load() >= 1
     assert check.get(key) == "kept"

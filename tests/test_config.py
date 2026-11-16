@@ -24,6 +24,8 @@ def test_defaults_when_env_is_empty():
     assert cfg.replication_factor == 2
     assert cfg.ring_replicas == 100
     assert cfg.max_batch_size == 1000
+    assert cfg.wal_path == "data/cache_wal.jsonl"
+    assert cfg.wal_checkpoint_records == 1000
     assert set(cfg.sources.values()) == {"default"}
 
 
@@ -38,6 +40,8 @@ def test_env_overrides_each_value():
             "CACHE_REPLICATION_FACTOR": "3",
             "CACHE_RING_REPLICAS": "10",
             "CACHE_MAX_BATCH_SIZE": "25",
+            "CACHE_WAL_PATH": "data/wal-test.jsonl",
+            "CACHE_WAL_CHECKPOINT_RECORDS": "5",
         }
     )
     assert cfg.capacity == 50
@@ -48,6 +52,8 @@ def test_env_overrides_each_value():
     assert cfg.replication_factor == 3
     assert cfg.ring_replicas == 10
     assert cfg.max_batch_size == 25
+    assert cfg.wal_path == "data/wal-test.jsonl"
+    assert cfg.wal_checkpoint_records == 5
     assert set(cfg.sources.values()) == {"env"}
 
 
@@ -83,6 +89,13 @@ def test_non_positive_sweep_interval_fails_fast():
 def test_non_positive_replication_factor_fails_fast():
     with pytest.raises(ValueError, match="CACHE_REPLICATION_FACTOR"):
         CacheConfig.from_env({"CACHE_REPLICATION_FACTOR": "0"})
+
+
+def test_non_positive_wal_checkpoint_records_fails_fast():
+    with pytest.raises(ValueError, match="CACHE_WAL_CHECKPOINT_RECORDS"):
+        CacheConfig.from_env({"CACHE_WAL_CHECKPOINT_RECORDS": "0"})
+    with pytest.raises(ValueError, match="CACHE_WAL_CHECKPOINT_RECORDS"):
+        CacheConfig.from_env({"CACHE_WAL_CHECKPOINT_RECORDS": "abc"})
 
 
 def test_unknown_policy_fails_fast():

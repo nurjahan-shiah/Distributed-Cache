@@ -1,9 +1,10 @@
-"""Day 11, HTTP API around the KV store, with disk persistence, sharding,
+"""Day 12, HTTP API around the KV store, with disk persistence, sharding,
 a switchable LRU and LFU eviction policy, a background TTL sweeper,
 stats and health endpoints, batch get and set endpoints, a compare
 and set endpoint, replication with primary and replica sync on the
-cluster, config from environment variables, and a concurrency
-benchmark with a lock review in benchmarks/concurrency.py."""
+cluster, config from environment variables, a write ahead log for
+durability with a checkpoint endpoint, and a concurrency benchmark
+with a lock review in benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +22,8 @@ store = KVStore(
     capacity=config.capacity,
     snapshot_path=Path(config.snapshot_path),
     eviction_policy=config.eviction_policy,
+    wal_path=Path(config.wal_path),
+    wal_checkpoint_records=config.wal_checkpoint_records,
 )
 store.load()
 store.start_sweeper(interval_seconds=config.sweep_interval_seconds)
@@ -69,14 +72,13 @@ def compare_and_set(req: CompareAndSetRequest):
     expected=None means the key must be missing, so this also
     creates a key only when nothing is there. A failed compare is
     a 200 with success false, not an error, because the caller
-    asked a question and got an answer. Only a successful write
-    snapshots, a failed compare changed nothing.
+    asked a question and got an answer. A successful write is
+    logged to the write ahead log by the store, so it survives a
+    restart, and a failed compare changed nothing.
     """
     success = store.compare_and_set(
         req.key, req.expected, req.value, req.ttl_seconds
     )
-    if success:
-        store.snapshot()
     return {"key": req.key, "success": success}
 
 
@@ -101,12 +103,11 @@ def batch_get(req: BatchGetRequest):
 
 @app.post("/cache/batch/set")
 def batch_set(req: BatchSetRequest):
-    """Set many keys in one request, with one snapshot at the end.
+    """Set many keys in one request, logged as one WAL record.
 
-    Every key gets the same TTL. The snapshot runs once for the
-    whole batch, not once per key, which is the point of batching:
-    one O(n) snapshot instead of one per key. The batch is capped
-    at MAX_BATCH_SIZE keys.
+    Every key gets the same TTL. The batch is logged before it is
+    applied, so a crash cannot half apply it, and it is capped at
+    MAX_BATCH_SIZE keys.
     """
     if len(req.items) > MAX_BATCH_SIZE:
         raise HTTPException(
@@ -114,8 +115,24 @@ def batch_set(req: BatchSetRequest):
             detail=f"batch is limited to {MAX_BATCH_SIZE} keys",
         )
     count = store.set_many(req.items, req.ttl_seconds)
-    store.snapshot()
     return {"set": count, "keys": list(req.items)}
+
+
+@app.post("/checkpoint")
+def checkpoint():
+    """Snapshot the store and truncate the write ahead log.
+
+    After this, the snapshot holds every key and the log is empty,
+    so a restart replays nothing. The log also checkpoints itself
+    after CACHE_WAL_CHECKPOINT_RECORDS writes, so this endpoint is
+    for an operator who wants a clean snapshot on demand.
+    """
+    entries = store.checkpoint()
+    return {
+        "entries": entries,
+        "checkpoints": store.checkpoints,
+        "wal_records": store.wal_records,
+    }
 
 
 @app.post("/config/eviction-policy")
@@ -143,7 +160,6 @@ def get_config():
 @app.put("/cache/{key}")
 def set_key(key: str, req: SetRequest):
     store.set(key, req.value, req.ttl_seconds)
-    store.snapshot()
     return {"key": key, "value": req.value}
 
 
@@ -159,7 +175,6 @@ def get_key(key: str):
 def delete_key(key: str):
     if not store.delete(key):
         raise HTTPException(status_code=404, detail="Key not found")
-    store.snapshot()
     return {"key": key, "deleted": True}
 
 
