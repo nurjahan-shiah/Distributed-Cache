@@ -1,10 +1,11 @@
-"""Day 12, HTTP API around the KV store, with disk persistence, sharding,
+"""Day 13, HTTP API around the KV store, with disk persistence, sharding,
 a switchable LRU and LFU eviction policy, a background TTL sweeper,
 stats and health endpoints, batch get and set endpoints, a compare
 and set endpoint, replication with primary and replica sync on the
 cluster, config from environment variables, a write ahead log for
-durability with a checkpoint endpoint, and a concurrency benchmark
-with a lock review in benchmarks/concurrency.py."""
+durability with a checkpoint endpoint, eviction and memory limits
+with per entry size tracking, and a concurrency benchmark with a
+lock review in benchmarks/concurrency.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +25,7 @@ store = KVStore(
     eviction_policy=config.eviction_policy,
     wal_path=Path(config.wal_path),
     wal_checkpoint_records=config.wal_checkpoint_records,
+    max_memory_bytes=config.max_memory_bytes or None,
 )
 store.load()
 store.start_sweeper(interval_seconds=config.sweep_interval_seconds)
@@ -33,6 +35,7 @@ cluster = ShardedStore(
     replicas=config.ring_replicas,
     eviction_policy=config.eviction_policy,
     replication_factor=config.replication_factor,
+    max_memory_bytes=config.max_memory_bytes or None,
 )
 cluster.start_sweeper(interval_seconds=config.sweep_interval_seconds)
 
@@ -183,6 +186,46 @@ def stats():
     result = store.stats()
     result["cluster"] = cluster.stats()
     return result
+
+
+@app.get("/memory")
+def memory():
+    """Memory use for the store and for the cluster, in one place.
+
+    Sizes are the charged bytes the store tracks, key plus value as
+    UTF-8 plus the per entry overhead, not a process RSS reading, so
+    the numbers match what the memory limit enforces. The limit is
+    per store and per shard, so the cluster total is the sum across
+    nodes, and the per node detail lives in /stats under cluster.
+    memory_used_percent is null when no limit is set.
+    """
+    stats = store.stats()
+    cluster_stats = cluster.stats()
+    return {
+        "size": stats["size"],
+        "capacity": stats["capacity"],
+        "memory_bytes": stats["memory_bytes"],
+        "max_memory_bytes": stats["max_memory_bytes"],
+        "memory_used_percent": stats["memory_used_percent"],
+        "entry_overhead_bytes": stats["entry_overhead_bytes"],
+        "evictions": stats["evictions"],
+        "oversize_writes": stats["oversize_writes"],
+        "cluster": {
+            "nodes": cluster_stats["nodes"],
+            "total_size": cluster_stats["total_size"],
+            "total_memory_bytes": cluster_stats["total_memory_bytes"],
+            "max_memory_bytes": cluster_stats["max_memory_bytes"],
+            "per_node": {
+                name: {
+                    "size": node["size"],
+                    "memory_bytes": node["memory_bytes"],
+                    "max_memory_bytes": node["max_memory_bytes"],
+                    "memory_used_percent": node["memory_used_percent"],
+                }
+                for name, node in cluster_stats["per_node"].items()
+            },
+        },
+    }
 
 
 def readiness(store, cluster):

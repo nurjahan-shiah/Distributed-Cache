@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 12 is done, 2026-11-16. The project is finished when every item below is checked off.
+Day 13 is done, 2026-11-17. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -64,6 +64,13 @@ Day 12 is done, 2026-11-16. The project is finished when every item below is che
   hardcoded values as defaults, and `GET /config` shows the
   effective config plus whether each value came from the environment
   or a default, while an invalid value fails fast at startup
+- Eviction and memory limits, each entry is charged its key and
+  value as UTF-8 bytes plus a fixed 64 byte overhead, the store
+  evicts by LRU or LFU when it passes its byte budget as well as
+  its key count capacity, `GET /stats` and `GET /memory` report
+  memory used, the budget, and the percentage used, and a single
+  value bigger than the whole budget is kept and counted as an
+  oversize write instead of vanishing on write
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -84,7 +91,8 @@ CACHE_SNAPSHOT_PATH=data/cache_snapshot.json \
 CACHE_SWEEP_INTERVAL_SECONDS=10 CACHE_NODES=node-a,node-b,node-c \
 CACHE_REPLICATION_FACTOR=2 CACHE_RING_REPLICAS=100 \
 CACHE_MAX_BATCH_SIZE=1000 CACHE_WAL_PATH=data/cache_wal.jsonl \
-CACHE_WAL_CHECKPOINT_RECORDS=1000 uvicorn app.main:app
+CACHE_WAL_CHECKPOINT_RECORDS=1000 \
+CACHE_MAX_MEMORY_BYTES=0 uvicorn app.main:app
 ```
 
 ## Run tests
@@ -105,7 +113,7 @@ pytest
 - [x] Day 10, Replication, primary and replica sync, 2026-11-13
 - [x] Day 11, Config from environment, capacity and defaults, 2026-11-15
 - [x] Day 12, Write ahead log for durability, 2026-11-16
-- [ ] Day 13, Eviction and memory limits, size tracking
+- [x] Day 13, Eviction and memory limits, size tracking, 2026-11-17
 - [ ] Day 14, Load test script and real benchmark numbers
 - [ ] Day 15, System design writeup, docs/system-design.md
 - [ ] Day 16, Interview talking points in README
@@ -306,4 +314,29 @@ pytest
   honest cost of durability on one disk, and production systems
   usually group commit or fsync on a timer to trade a little
   durability for throughput.
+- Day 13 memory limit design: an entry is charged its key and value
+  as UTF-8 bytes plus a fixed 64 byte overhead for the dict slot,
+  the expiry, the frequency, and the tuple, so the budget is an
+  estimate, not a process RSS reading, and the same number is what
+  the tests assert, which keeps it honest. The store keeps a
+  running total and a per key size map, updated on every mutation,
+  expiry, eviction, load, and replay, so checking the budget is
+  O(1) and never rescans the store, and snapshot load and WAL
+  replay recompute sizes instead of storing them, so a restart
+  reports the exact same total. Eviction now has two triggers,
+  key count and charged bytes, and both use the same LRU or LFU
+  victim choice, so one eviction path serves both limits. A single
+  value bigger than the whole budget is kept, not refused and not
+  evicted on write, because refusing it would fail a write the
+  caller already made, and evicting it would make the write
+  silently vanish, so it is stored, counted in oversize_writes,
+  and visible in stats, and the next write evicts it first under
+  LRU, since it is the oldest entry. The limit is per store and
+  per shard, the same way capacity already works, so a cluster
+  budget is the sum across nodes, not one shared pool, and the
+  cluster stats roll the totals up. The default is 0, meaning no
+  limit, so a plain run behaves exactly as it did before Day 13,
+  and the limit is a startup config value, not a live resize,
+  because resizing live would mean deciding what to evict mid
+  flight, which is the same reason Day 11 kept config frozen.
 

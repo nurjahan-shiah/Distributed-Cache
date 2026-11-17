@@ -19,6 +19,9 @@ Variables, all optional:
     CACHE_WAL_PATH, path, default data/cache_wal.jsonl.
     CACHE_WAL_CHECKPOINT_RECORDS, int, default 1000, writes before a
     snapshot and log truncate.
+    CACHE_MAX_MEMORY_BYTES, int, default 0, charged bytes per store
+    before memory eviction starts, 0 means no memory limit, only the
+    key count capacity applies.
 
 Invalid values fail fast with a ValueError at startup instead of
 silently falling back to a default. A typo like CACHE_CAPACITY=abc
@@ -54,6 +57,18 @@ def _parse_positive_int(raw, name):
     return value
 
 
+def _parse_non_negative_int(raw, name):
+    """Parse an env var as a non negative int, failing fast.
+
+    Used for the memory limit, where 0 means unlimited, so 0 is a
+    real value and only negatives are rejected.
+    """
+    value = _parse_int(raw, name)
+    if value < 0:
+        raise ValueError(f"{name} must not be negative, got {value}")
+    return value
+
+
 @dataclass(frozen=True)
 class CacheConfig:
     """The effective config for one process, plus where each value came from.
@@ -74,6 +89,11 @@ class CacheConfig:
     max_batch_size: int = 1000
     wal_path: str = "data/cache_wal.jsonl"
     wal_checkpoint_records: int = 1000
+    # Day 13: 0 means no memory limit, the store only enforces its
+    # key count capacity. A positive value is the charged bytes
+    # budget per store, and the app translates 0 to None for the
+    # store, which is where unlimited lives.
+    max_memory_bytes: int = 0
     sources: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -126,6 +146,9 @@ class CacheConfig:
         wal_checkpoint = take(
             "CACHE_WAL_CHECKPOINT_RECORDS", _parse_positive_int
         )
+        max_memory = take(
+            "CACHE_MAX_MEMORY_BYTES", _parse_non_negative_int
+        )
 
         kwargs = {}
         if capacity is not None:
@@ -148,6 +171,8 @@ class CacheConfig:
             kwargs["wal_path"] = wal_path
         if wal_checkpoint is not None:
             kwargs["wal_checkpoint_records"] = wal_checkpoint
+        if max_memory is not None:
+            kwargs["max_memory_bytes"] = max_memory
         kwargs["sources"] = {
             field_name: sources.get(env_name, "default")
             for field_name, env_name in _ENV_NAMES.items()
@@ -172,6 +197,7 @@ class CacheConfig:
             "max_batch_size": self.max_batch_size,
             "wal_path": self.wal_path,
             "wal_checkpoint_records": self.wal_checkpoint_records,
+            "max_memory_bytes": self.max_memory_bytes,
             "sources": dict(self.sources),
         }
 
@@ -187,6 +213,7 @@ _ENV_NAMES = {
     "max_batch_size": "CACHE_MAX_BATCH_SIZE",
     "wal_path": "CACHE_WAL_PATH",
     "wal_checkpoint_records": "CACHE_WAL_CHECKPOINT_RECORDS",
+    "max_memory_bytes": "CACHE_MAX_MEMORY_BYTES",
 }
 
 

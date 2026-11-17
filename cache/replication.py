@@ -37,18 +37,33 @@ from cache.store import KVStore
 
 
 class ReplicatedShard:
-    def __init__(self, capacity=1000, replication_factor=2, eviction_policy="lru"):
+    def __init__(
+        self,
+        capacity=1000,
+        replication_factor=2,
+        eviction_policy="lru",
+        max_memory_bytes=None,
+    ):
         if replication_factor < 1:
             raise ValueError("replication_factor must be at least 1")
         self.capacity = capacity
         self.replication_factor = replication_factor
         self.eviction_policy = eviction_policy
+        self.max_memory_bytes = max_memory_bytes
         # The primary and the replicas are public attributes on purpose,
         # so tests and operators can inspect one copy directly instead
         # of guessing what it holds from the outside.
-        self.primary = KVStore(capacity=capacity, eviction_policy=eviction_policy)
+        self.primary = KVStore(
+            capacity=capacity,
+            eviction_policy=eviction_policy,
+            max_memory_bytes=max_memory_bytes,
+        )
         self.replicas = [
-            KVStore(capacity=capacity, eviction_policy=eviction_policy)
+            KVStore(
+                capacity=capacity,
+                eviction_policy=eviction_policy,
+                max_memory_bytes=max_memory_bytes,
+            )
             for _ in range(replication_factor - 1)
         ]
         self._copies = [self.primary] + self.replicas

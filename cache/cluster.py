@@ -42,10 +42,12 @@ class ShardedStore:
         replicas=100,
         eviction_policy="lru",
         replication_factor=1,
+        max_memory_bytes=None,
     ):
         if replication_factor < 1:
             raise ValueError("replication_factor must be at least 1")
         self.capacity = capacity
+        self.max_memory_bytes = max_memory_bytes
         self.eviction_policy = eviction_policy
         self.replication_factor = replication_factor
         self.ring = ConsistentHashRing(replicas=replicas)
@@ -61,15 +63,22 @@ class ShardedStore:
         cluster behaves exactly as it did before Day 10. A factor
         above 1 builds a ReplicatedShard, one primary plus replicas,
         behind the same method calls, so the rest of the cluster code
-        does not care which kind of shard it is talking to.
+        does not care which kind of shard it is talking to. The
+        memory limit is per shard, not per cluster, so each node
+        enforces its own budget, the same way capacity already works.
         """
         if self.replication_factor > 1:
             return ReplicatedShard(
                 capacity=self.capacity,
                 replication_factor=self.replication_factor,
                 eviction_policy=self.eviction_policy,
+                max_memory_bytes=self.max_memory_bytes,
             )
-        return KVStore(capacity=self.capacity, eviction_policy=self.eviction_policy)
+        return KVStore(
+            capacity=self.capacity,
+            eviction_policy=self.eviction_policy,
+            max_memory_bytes=self.max_memory_bytes,
+        )
 
     def node_for(self, key):
         return self.ring.get_node(key)
@@ -367,6 +376,10 @@ class ShardedStore:
             "nodes": sorted(per_node),
             "replication_factor": self.replication_factor,
             "total_size": sum(s["size"] for s in per_node.values()),
+            "total_memory_bytes": sum(
+                s["memory_bytes"] for s in per_node.values()
+            ),
+            "max_memory_bytes": self.max_memory_bytes,
             "total_hits": total_hits,
             "total_misses": total_misses,
             "hit_rate": round(total_hits / reads, 4) if reads else 0.0,

@@ -26,6 +26,7 @@ def test_defaults_when_env_is_empty():
     assert cfg.max_batch_size == 1000
     assert cfg.wal_path == "data/cache_wal.jsonl"
     assert cfg.wal_checkpoint_records == 1000
+    assert cfg.max_memory_bytes == 0
     assert set(cfg.sources.values()) == {"default"}
 
 
@@ -42,6 +43,7 @@ def test_env_overrides_each_value():
             "CACHE_MAX_BATCH_SIZE": "25",
             "CACHE_WAL_PATH": "data/wal-test.jsonl",
             "CACHE_WAL_CHECKPOINT_RECORDS": "5",
+            "CACHE_MAX_MEMORY_BYTES": "65536",
         }
     )
     assert cfg.capacity == 50
@@ -54,6 +56,7 @@ def test_env_overrides_each_value():
     assert cfg.max_batch_size == 25
     assert cfg.wal_path == "data/wal-test.jsonl"
     assert cfg.wal_checkpoint_records == 5
+    assert cfg.max_memory_bytes == 65536
     assert set(cfg.sources.values()) == {"env"}
 
 

@@ -1,12 +1,18 @@
 """Thread safe key value store with switchable LRU and LFU eviction, TTL
 expiry, a background sweeper that removes expired keys, an atomic
-compare and set, and a write ahead log for durability.
+compare and set, a write ahead log for durability, and a memory
+limit with per entry size tracking.
 
 Every mutation is written to the log and fsynced before it is applied
 in memory, so a crash never loses an acknowledged write. On startup,
 load() reads the snapshot and then replays the log, so keys written
 since the last checkpoint come back. A checkpoint writes a snapshot
 and truncates the log, which bounds replay and log size.
+
+Size tracking is an estimate, not a process memory reading. Each entry
+counts its key and value as UTF-8 bytes plus a fixed overhead for the
+bookkeeping around them, so the store can enforce a byte budget and
+evict before the process grows without bound.
 """
 import json
 import threading
@@ -18,6 +24,13 @@ from cache.wal import WriteAheadLog
 
 POLICIES = ("lru", "lfu")
 
+# Bytes charged per entry on top of its key and value, for the dict
+# slot, the expiry float, the access frequency, and the tuple holding
+# the value. It is a fixed estimate, not a measured RSS figure, so it
+# is stable across runs and easy to reason about in a test, and it is
+# reported in stats so an operator can see what it assumes.
+ENTRY_OVERHEAD_BYTES = 64
+
 
 class KVStore:
     def __init__(
@@ -27,12 +40,16 @@ class KVStore:
         eviction_policy="lru",
         wal_path=None,
         wal_checkpoint_records=1000,
+        max_memory_bytes=None,
     ):
         if eviction_policy not in POLICIES:
             raise ValueError("eviction_policy must be lru or lfu")
         if wal_checkpoint_records <= 0:
             raise ValueError("wal_checkpoint_records must be positive")
+        if max_memory_bytes is not None and max_memory_bytes <= 0:
+            raise ValueError("max_memory_bytes must be positive or None")
         self.capacity = capacity
+        self.max_memory_bytes = max_memory_bytes
         self.snapshot_path = Path(snapshot_path) if snapshot_path else None
         self.eviction_policy = eviction_policy
         self.wal_path = Path(wal_path) if wal_path else None
@@ -53,6 +70,13 @@ class KVStore:
             )
         self._data = OrderedDict()
         self._freq = {}
+        # Day 13, size tracking: _sizes holds the charged bytes per
+        # key, and _memory_bytes is the running total, so the store
+        # never has to rescan the whole dict to know how full it is.
+        # Every place that adds or removes an entry updates both, so
+        # the total stays exact for the estimate it tracks.
+        self._sizes = {}
+        self._memory_bytes = 0
         # Day 12: a plain Lock would deadlock when a checkpoint runs
         # inside a mutation, because checkpoint snapshots while the
         # mutation already holds the lock. An RLock lets the same
@@ -66,6 +90,10 @@ class KVStore:
         self.sweeps_run = 0
         self.cas_success = 0
         self.cas_failure = 0
+        # Day 13: how many writes left the store over its memory
+        # budget because one value alone was bigger than the budget.
+        # Those writes are kept, not refused, and this counts them.
+        self.oversize_writes = 0
         self.started_at = time.time()
         self._sweeper_thread = None
         self._sweeper_stop = None
@@ -78,6 +106,64 @@ class KVStore:
 
     def _is_expired(self, expires_at):
         return expires_at is not None and expires_at <= time.time()
+
+    @staticmethod
+    def _entry_size(key, value):
+        """Charged bytes for one entry, key plus value plus overhead.
+
+        Keys and values are strings in this API, so UTF-8 length is
+        the honest size. A non string value falls back to its repr,
+        so a caller passing one never breaks the accounting.
+        """
+        key_bytes = len(key.encode("utf-8")) if isinstance(key, str) else len(repr(key).encode("utf-8"))
+        if isinstance(value, str):
+            value_bytes = len(value.encode("utf-8"))
+        else:
+            value_bytes = len(repr(value).encode("utf-8"))
+        return key_bytes + value_bytes + ENTRY_OVERHEAD_BYTES
+
+    def _record_size(self, key, value):
+        """Charge an entry, replacing its old size when it exists.
+
+        Callers hold the lock, and call this after writing _data, so
+        the size map and the data map agree. An overwrite subtracts
+        the old size first, so the total never double counts a key.
+        """
+        size = self._entry_size(key, value)
+        self._memory_bytes += size - self._sizes.get(key, 0)
+        self._sizes[key] = size
+
+    def _forget_size(self, key):
+        """Drop the charge for a removed entry. Callers hold the lock."""
+        self._memory_bytes -= self._sizes.pop(key, 0)
+
+    def _over_budget(self):
+        """True when a memory limit is set and the store is over it."""
+        return (
+            self.max_memory_bytes is not None
+            and self._memory_bytes > self.max_memory_bytes
+        )
+
+    @property
+    def memory_bytes(self):
+        """Charged bytes held now, under the lock, so a concurrent
+        write cannot change the total mid read."""
+        with self._lock:
+            return self._memory_bytes
+
+    def _note_oversize_write(self, keys):
+        """Count a write that left the store over its memory budget.
+
+        Callers hold the lock, and call this after eviction, so it
+        only counts when eviction could not bring the store back
+        under budget, which means one value alone is bigger than
+        the budget. A write that fits after evicting colder keys is
+        not oversize, and neither is a write LFU evicted straight
+        away as the coldest key, so the check also requires at
+        least one written key to still be present.
+        """
+        if self._over_budget() and any(key in self._data for key in keys):
+            self.oversize_writes += 1
 
     def set_eviction_policy(self, policy):
         """Switch the eviction policy at runtime.
@@ -92,16 +178,24 @@ class KVStore:
             self.eviction_policy = policy
 
     def _evict_if_needed(self):
-        """Evict until the store fits capacity. Callers hold the lock.
+        """Evict until the store fits capacity and its memory budget.
 
-        LRU evicts the front of the ordered dict, the least recently
-        used key. LFU evicts the key with the lowest access count, and
-        breaks ties by least recently used, which is the key's position
-        in the ordered dict. The LFU scan is O(n) per eviction, simple
-        and correct at this scale, while a production O(1) LFU would
-        keep frequency buckets instead.
+        Callers hold the lock. LRU evicts the front of the ordered
+        dict, the least recently used key. LFU evicts the key with
+        the lowest access count, and breaks ties by least recently
+        used, which is the key's position in the ordered dict. The
+        LFU scan is O(n) per eviction, simple and correct at this
+        scale, while a production O(1) LFU would keep frequency
+        buckets instead. Memory eviction stops at one entry, so a
+        single value bigger than the whole budget is kept and
+        counted as an oversize write, instead of being evicted the
+        moment it is written, which would make the write silently
+        vanish. With no memory limit set, only the capacity rule
+        applies, so a plain store behaves exactly as before.
         """
-        while len(self._data) > self.capacity:
+        while len(self._data) > self.capacity or (
+            self._over_budget() and len(self._data) > 1
+        ):
             if self.eviction_policy == "lfu":
                 victim = min(
                     enumerate(self._data),
@@ -112,6 +206,7 @@ class KVStore:
             else:
                 victim, _value = self._data.popitem(last=False)
                 self._freq.pop(victim, None)
+            self._forget_size(victim)
             self.evictions += 1
 
     def _append_wal(self, record):
@@ -184,7 +279,9 @@ class KVStore:
             else:
                 self._freq[key] = 1
             self._data[key] = (value, expires_at)
+            self._record_size(key, value)
             self._evict_if_needed()
+            self._note_oversize_write([key])
             self._maybe_checkpoint()
 
     def get(self, key):
@@ -197,6 +294,7 @@ class KVStore:
             if self._is_expired(expires_at):
                 del self._data[key]
                 self._freq.pop(key, None)
+                self._forget_size(key)
                 self.misses += 1
                 return None
             self._data.move_to_end(key)
@@ -225,6 +323,7 @@ class KVStore:
                 if self._is_expired(expires_at):
                     del self._data[key]
                     self._freq.pop(key, None)
+                    self._forget_size(key)
                     self.misses += 1
                     continue
                 self._data.move_to_end(key)
@@ -263,7 +362,9 @@ class KVStore:
                 else:
                     self._freq[key] = 1
                 self._data[key] = (value, expires_at)
+                self._record_size(key, value)
             self._evict_if_needed()
+            self._note_oversize_write([key for key, _value in pairs])
             self._maybe_checkpoint()
         return len(pairs)
 
@@ -293,6 +394,7 @@ class KVStore:
                 if self._is_expired(expires_at):
                     del self._data[key]
                     self._freq.pop(key, None)
+                    self._forget_size(key)
                     item = None
             if item is None:
                 if expected is not None:
@@ -312,7 +414,9 @@ class KVStore:
                 )
                 self._data[key] = (value, expires_at)
                 self._freq[key] = 1
+                self._record_size(key, value)
                 self._evict_if_needed()
+                self._note_oversize_write([key])
                 self.cas_success += 1
                 self._maybe_checkpoint()
                 return True
@@ -333,7 +437,9 @@ class KVStore:
             del self._data[key]
             self._data[key] = (value, expires_at)
             self._freq[key] = self._freq.get(key, 0) + 1
+            self._record_size(key, value)
             self._evict_if_needed()
+            self._note_oversize_write([key])
             self.cas_success += 1
             self._maybe_checkpoint()
             return True
@@ -347,6 +453,7 @@ class KVStore:
             self._append_wal({"op": "delete", "key": key})
             self._freq.pop(key, None)
             del self._data[key]
+            self._forget_size(key)
             self._maybe_checkpoint()
             return True
 
@@ -370,6 +477,7 @@ class KVStore:
             for key in expired:
                 del self._data[key]
                 self._freq.pop(key, None)
+                self._forget_size(key)
             self.expired_swept += len(expired)
             self.sweeps_run += 1
             return len(expired)
@@ -450,6 +558,7 @@ class KVStore:
                 if self._is_expired(expires_at):
                     del self._data[key]
                     self._freq.pop(key, None)
+                    self._forget_size(key)
                 else:
                     live.append((key, value, expires_at))
             return live
@@ -467,6 +576,17 @@ class KVStore:
             return {
                 "size": len(self._data),
                 "capacity": self.capacity,
+                "memory_bytes": self._memory_bytes,
+                "max_memory_bytes": self.max_memory_bytes,
+                "memory_used_percent": (
+                    round(
+                        self._memory_bytes / self.max_memory_bytes * 100, 2
+                    )
+                    if self.max_memory_bytes
+                    else None
+                ),
+                "entry_overhead_bytes": ENTRY_OVERHEAD_BYTES,
+                "oversize_writes": self.oversize_writes,
                 "eviction_policy": self.eviction_policy,
                 "hits": self.hits,
                 "misses": self.misses,
@@ -565,6 +685,7 @@ class KVStore:
                         del self._data[key]
                     self._data[key] = (record["value"], record.get("expires_at"))
                     self._freq[key] = 1
+                    self._record_size(key, record["value"])
                     applied += 1
                     self._evict_if_needed()
                 elif op == "set_many":
@@ -578,6 +699,7 @@ class KVStore:
                             del self._data[key]
                         self._data[key] = (value, record.get("expires_at"))
                         self._freq[key] = 1
+                        self._record_size(key, value)
                         applied += 1
                     self._evict_if_needed()
                 elif op == "delete":
@@ -585,6 +707,7 @@ class KVStore:
                         continue
                     self._data.pop(record["key"], None)
                     self._freq.pop(record["key"], None)
+                    self._forget_size(record["key"])
                     applied += 1
         self.wal_replayed = applied
         return applied
@@ -598,6 +721,8 @@ class KVStore:
         eviction order, so a snapshot larger than capacity still loads
         cleanly. Access frequencies are runtime state and are not stored
         in the snapshot, so loaded keys start at a frequency of 1.
+        Entry sizes are recomputed the same way on load, so the
+        memory total is exact after a restart without storing it.
         Snapshots written before Day 12 carry no WAL seq and load as
         holding seq 0, so every WAL record replays. Returns how many
         entries the snapshot loaded plus how many WAL records were
@@ -635,6 +760,7 @@ class KVStore:
                             del self._data[key]
                         self._data[key] = (item["value"], item["expires_at"])
                         self._freq[key] = 1
+                        self._record_size(key, item["value"])
                         loaded += 1
                         self._evict_if_needed()
         if self.wal is not None:
