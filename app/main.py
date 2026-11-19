@@ -5,7 +5,8 @@ and set endpoint, replication with primary and replica sync on the
 cluster, config from environment variables, a write ahead log for
 durability with a checkpoint endpoint, eviction and memory limits
 with per entry size tracking, and a concurrency benchmark with a
-lock review in benchmarks/concurrency.py."""
+lock review in benchmarks/concurrency.py, and a load test script
+with real benchmark numbers in benchmarks/load_test.py."""
 from datetime import datetime, timezone
 from pathlib import Path
 

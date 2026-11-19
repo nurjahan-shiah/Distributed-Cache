@@ -7,7 +7,7 @@ scaling decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 13 is done, 2026-11-17. The project is finished when every item below is checked off.
+Day 14 is done, 2026-11-18. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `PUT /cache/{key}` with a value and an optional TTL in seconds
@@ -71,6 +71,14 @@ Day 13 is done, 2026-11-17. The project is finished when every item below is che
   memory used, the budget, and the percentage used, and a single
   value bigger than the whole budget is kept and counted as an
   oversize write instead of vanishing on write
+- Load test, `python -m benchmarks.load_test` drives the HTTP API
+  with configurable threads, ops, read share, key pool, value
+  size, and disjoint or shared keys, reports ops per second plus
+  mean, p50, p95, p99, and max latency, with hit rate and
+  evictions from `/stats`, and verifies every value it wrote, and
+  the real numbers live in `benchmarks/results.md`: 782.8 ops/s
+  at p50 7.26 ms and p95 32.09 ms for 8 threads, 80 percent reads,
+  against a live server on 2026-11-18
 
 ## Stack
 Python, FastAPI, standard library only for the store itself.
@@ -114,7 +122,7 @@ pytest
 - [x] Day 11, Config from environment, capacity and defaults, 2026-11-15
 - [x] Day 12, Write ahead log for durability, 2026-11-16
 - [x] Day 13, Eviction and memory limits, size tracking, 2026-11-17
-- [ ] Day 14, Load test script and real benchmark numbers
+- [x] Day 14, Load test script and real benchmark numbers, 2026-11-18
 - [ ] Day 15, System design writeup, docs/system-design.md
 - [ ] Day 16, Interview talking points in README
 - [ ] Day 17, Final polish, cleanup, project complete
@@ -339,4 +347,30 @@ pytest
   and the limit is a startup config value, not a live resize,
   because resizing live would mean deciding what to evict mid
   flight, which is the same reason Day 11 kept config frozen.
+- Day 14 load test design: the script drives the real HTTP API,
+  not the store directly, so the numbers include uvicorn, JSON,
+  and the WAL fsync on every write, which is the point, a load
+  test that skips the stack measures the wrong thing. Each thread
+  works its own keys in disjoint mode, so a read can check the
+  value it expects, and a lost or corrupt write shows up as a
+  wrong value instead of a fast run, while shared mode uses one
+  key pool like a hot key workload and checks only status codes,
+  since another thread may have overwritten the key. A warmup
+  prefills every key once, untimed, so reads mostly hit, and a
+  read of a key the thread wrote that comes back 404 is counted
+  as an evicted read, not an error, since eviction is correct
+  when the store is full. In process mode uses one TestClient per
+  thread, because the installed httpx ASGI transport is async
+  only, and it is slow, 132.9 ops/s against 782.8 live, so it is
+  for correctness smoke tests only, and the live server numbers
+  in benchmarks/results.md are the headline. The live client
+  sets trust_env False, so it connects direct instead of reading
+  proxy variables from the environment. The numbers say threads
+  add latency without adding throughput, one thread does 626.1
+  ops/s at p50 1.49 ms and eight threads do 782.8 ops/s at p50
+  7.26 ms, write only is the slowest mix at 659.9 ops/s because
+  every write fsyncs, and 21 hot keys cost the same as 1000
+  disjoint keys, so the bottleneck is the lock and the fsync,
+  not key contention, which is the same scaling lesson as Day 7,
+  now measured over HTTP.
 
